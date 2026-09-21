@@ -534,16 +534,18 @@ for the full design.
 
 ---
 
-## Supported models (v0.2.0)
+## Supported models (v0.2.1)
 
 - **Llama** family — `meta-llama/Llama-3.1-*`, `meta-llama/Llama-3.2-*`, `TinyLlama/TinyLlama-*`
 - **Mistral** family — `mistralai/Mistral-7B-*`
 - **Qwen2** family — `Qwen/Qwen2-0.5B-Instruct` through `Qwen/Qwen2-72B-Instruct` (handles tied embeddings)
+- **Phi-3** family — `microsoft/Phi-3-mini-*` (handles fused qkv_proj + gate_up_proj)
+- **Gemma2** family — `google/gemma-2-*` (Llama-compatible layout)
 
 Adding new architectures: subclass `ArchitectureConverter`, register it. See
 [architecture.md on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/architecture.md).
 
-> **v0.2.0 caveat:** Hybrid models are produced with random-init SSM weights.
+> **v0.2.x caveat:** Hybrid models are produced with random-init SSM weights.
 > Distillation is a 2-step stub. For meaningful output, you'd need real
 > distillation training (v0.3). For now, `ssmforge convert` exercises the
 > full pipeline end-to-end on any supported source model — useful for

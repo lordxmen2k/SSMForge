@@ -1,6 +1,6 @@
 """SSMForge: convert pretrained transformers to hybrid SSM/attention models."""
 
-__version__ = "0.1.2"
+__version__ = "0.2.1"
 
 from ssmforge.pipeline import convert
 from ssmforge.result import ConversionResult
