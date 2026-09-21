@@ -33,7 +33,7 @@ ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
 ```
 
 ### In scope for v1.0
-1. **Source models:** Llama-3.1 / Llama-3.2 family (1B, 3B, 8B), Mistral-7B
+1. **Source models:** Llama-3.1 / Llama-3.2 family (1B, 3B, 8B). Mistral-7B is in v0.2 (per timeline §5).
 2. **Recipes:** `hybrid-25` (production), `hybrid-50` (production), `pure-mamba` (experimental, gated behind `--experimental` flag)
 3. **Quantization:** F16, Q8_0, Q5_K_M, Q4_K_M, Q4_K_S via `llama-quantize` subprocess
 4. **Output format:** GGUF (compatible with llama.cpp, ollama, LM Studio, Jan)
