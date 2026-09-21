@@ -25,6 +25,8 @@ def write_f16_gguf(
             "gguf package required for GGUF export. Install with: pip install gguf"
         ) from e
 
+    # Architecture name must match what llama.cpp's LLM_ARCH_SSMFORGE expects
+    # in our vendored fork (lordxmen2k/ssmforge-llama.cpp).
     writer = GGUFWriter(str(output_path), "ssmforge")
     name = getattr(config, "name_or_path", "model")
     writer.add_name(name)
