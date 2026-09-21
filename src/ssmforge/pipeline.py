@@ -67,6 +67,16 @@ def _run_pipeline(
     model, state_dict = _load_model(source)
     arch = _detect_architecture(model)
 
+    # Determine device once (CUDA if available, else CPU). Explicit (no implicit defaults).
+    import torch as _torch
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        try:
+            model = model.to(device)
+        except Exception as e:
+            print(f"Warning: could not move model to {device}: {e}. Falling back to CPU.")
+            device = "cpu"
+
     # Stage 2: Recipe plan
     recipe_obj = get_recipe(recipe)
     if recipe_obj.name == "pure-mamba" and not experimental:
@@ -140,6 +150,7 @@ def _run_pipeline(
             calibration_loader=cal,
             tokenizer=tokenizer,
             config=distill_config,
+            device=device,
         )
         try:
             trainer.train(num_steps=2)  # tiny for MVP
