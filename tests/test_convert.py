@@ -49,12 +49,11 @@ def test_convert_unknown_recipe_raises_unknown(tmp_path):
     assert "this-recipe-does-not-exist-xyz" in msg or "unknownrecipe" in msg
 
 
-@pytest.mark.skip(reason="pure-mamba recipe not yet registered (Task 23)")
 def test_convert_pure_mamba_without_experimental_raises(tmp_path):
     with patch("ssmforge.pipeline._load_model", return_value=(_fake_llama_model(), _fake_sd())):
         with pytest.raises(Exception) as exc:
             convert(source="fake", recipe="pure-mamba", output_dir=tmp_path, dry_run=True)
-    assert "experimental" in str(exc.value).lower() or "unknownrecipeerror" in str(exc.value).lower()
+    assert "experimental" in str(exc.value).lower()
 
 
 def test_convert_unsupported_arch_raises(tmp_path):
