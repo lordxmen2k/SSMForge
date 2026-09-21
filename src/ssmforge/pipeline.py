@@ -149,17 +149,72 @@ def _run_pipeline(
     else:
         stats["training_stats"] = {"skipped": True, "reason": "no tokenizer"}
 
-    # Stages 5-6: deferred to Phase 3
-    return ConversionResult(
-        gguf_path=None,
-        manifest_path=None,
-        stats={
-            **stats,
-            "note": (
-                "Stages 1-4 complete. Stages 5-6 (export, verify) will be wired in Phase 3."
-            ),
-        },
-    )
+    # Stage 5: Export
+    from datetime import datetime
+    from ssmforge.export.gguf_writer import write_f16_gguf
+    from ssmforge.export.llama_quantize import LlamaQuantizer
+    from ssmforge.export.manifest import Manifest, write_manifest, compute_file_sha
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = source.replace("/", "_").replace("\\", "_")[-64:]
+    f16_path = output_dir / f"{safe_name}.{recipe.upper().replace('-','')}.{quantize}.f16.gguf"
+    final_path = output_dir / f"{safe_name}.{recipe.upper().replace('-','')}.{quantize}.gguf"
+
+    try:
+        final_sd = {k: v.detach().cpu() for k, v in student.state_dict().items()} if tokenizer else target_sd
+        write_f16_gguf(
+            model_state_dict=final_sd,
+            config=config,
+            tokenizer=tokenizer,
+            output_path=f16_path,
+        )
+
+        if quantize != "F16":
+            try:
+                quantizer = LlamaQuantizer()
+                quantizer.quantize(f16_path, final_path, quantize)
+                if f16_path.exists():
+                    f16_path.unlink()
+            except Exception as e:
+                # Quantize binary may not be installed; fall back to F16
+                final_path = f16_path
+                stats["quantization_note"] = f"Quantize failed ({e}); kept F16 GGUF"
+        else:
+            final_path = f16_path
+
+        output_sha = compute_file_sha(final_path) if final_path.exists() else "unknown"
+
+        manifest = Manifest(
+            ssmforge_version="0.2.0",
+            source_model=source,
+            source_revision="unknown",
+            recipe=recipe,
+            quant_type=quantize if final_path != f16_path else "F16",
+            layer_mapping=[
+                {"index": spec.index, "layer_type": spec.layer_type.value}
+                for spec in plan
+            ],
+            calibration_data_sha=None,
+            training_stats=stats.get("training_stats"),
+            output_gguf_path=str(final_path),
+            output_gguf_sha=output_sha,
+            output_gguf_bytes=final_path.stat().st_size if final_path.exists() else 0,
+            created_at=datetime.now(),
+        )
+        manifest_path = output_dir / f"{safe_name}.{recipe.upper().replace('-','')}.{quantize}.manifest.json"
+        write_manifest(manifest, manifest_path)
+
+        return ConversionResult(
+            gguf_path=final_path,
+            manifest_path=manifest_path,
+            stats=stats,
+        )
+    except Exception as e:
+        return ConversionResult(
+            gguf_path=None,
+            manifest_path=None,
+            stats={**stats, "export_error": str(e)},
+        )
 
 
 def convert(
