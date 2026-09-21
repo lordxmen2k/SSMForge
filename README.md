@@ -10,7 +10,13 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
 ```bash
-pip install "ssmforge[mamba,export]"
+pip install "ssmforge[export]"
+```
+
+For native CUDA Mamba2 (Python 3.10–3.12 only):
+
+```bash
+pip install "ssmforge[export,mamba]"
 ```
 
 ```python
@@ -161,7 +167,7 @@ get real numbers for your model.
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install "ssmforge[mamba,export]"
+pip install "ssmforge[export]"
 ssmforge --help
 ```
 
@@ -176,7 +182,7 @@ python -m pip install --upgrade pip
 python -m pip config set global.index-url https://pypi.org/simple/
 
 # 3. Install SSMForge
-pip install "ssmforge[mamba,export]"
+pip install "ssmforge[export]"
 
 # 4. Install llama-quantize binary (needed for non-F16 quant)
 pip install llama-cpp-python
@@ -185,6 +191,23 @@ pip install llama-cpp-python
 #   cd llama.cpp && make llama-quantize
 #   export LLAMA_QUANTIZE_BIN="$(pwd)/llama-quantize"
 ```
+
+### Optional: native Mamba2 CUDA kernels
+
+The `[mamba]` extra is gated to **Python 3.9–3.12 only** (where `mamba-ssm`
+ships prebuilt wheels). On Python 3.13+ the extra installs nothing and SSMForge
+uses a pure-PyTorch fallback SSM layer (slower, no CUDA acceleration).
+
+```bash
+# Python 3.9, 3.10, 3.11, or 3.12 — gets real CUDA Mamba
+pip install "ssmforge[export,mamba]"
+
+# Python 3.13+ — gets the fallback (works fine, just slower)
+pip install "ssmforge[export]"
+```
+
+If you're on 3.13+ and want real CUDA Mamba later, set up Python 3.11 or 3.12
+in a separate venv and install SSMForge there.
 
 ### Verify
 

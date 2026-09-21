@@ -36,8 +36,8 @@ source .venv/bin/activate           # Linux/macOS
 python -m pip install --upgrade pip
 python -m pip config set global.index-url https://pypi.org/simple/
 
-# 3. Install SSMForge with all extras
-pip install "ssmforge[mamba,export]"
+# 3. Install SSMForge with the export extra
+pip install "ssmforge[export]"
 ```
 
 After install, verify everything works:
@@ -99,27 +99,51 @@ pip install --dry-run --quiet "setuptools>=68" && echo OK
 
 ### Step 4 — Install SSMForge
 
-SSMForge has three optional dependency groups. Pick the combo that matches
-what you want to do:
+SSMForge has three optional dependency groups:
 
 | Extra    | Installs                                  | When you need it |
 |----------|-------------------------------------------|------------------|
-| `mamba`  | `mamba-ssm`, `causal-conv1d`              | Real Mamba2 layers (vs the pure-PyTorch fallback) |
+| `mamba`  | `mamba-ssm`, `causal-conv1d`              | Real CUDA Mamba2 layers (vs the pure-PyTorch fallback) |
 | `export` | `gguf` (gguf-py)                          | Writing GGUF files for llama.cpp |
 | `dev`    | `pytest`, `pytest-cov`, `hypothesis`, `ruff` | Running the test suite |
 
 Common combinations:
 
 ```bash
-# Production use — distillation + GGUF export
-pip install "ssmforge[mamba,export]"
+# Production use — GGUF export (recommended)
+pip install "ssmforge[export]"
 
-# Development — includes everything + test deps
-pip install "ssmforge[dev]"
+# Production + CUDA Mamba (Python 3.9–3.12 only)
+pip install "ssmforge[export,mamba]"
 
-# Minimal — pure-PyTorch fallback, no GGUF export (Stage 5 will error)
+# Development — includes test deps
+pip install "ssmforge[export,dev]"
+
+# Minimal — no GGUF export (Stage 5 will error)
 pip install ssmforge
 ```
+
+**Note on the `[mamba]` extra:** `mamba-ssm` ships prebuilt wheels only for
+Python 3.9–3.12. The `[mamba]` extra in `pyproject.toml` is gated with
+`python_version < "3.13"` markers so it installs cleanly on Python 3.13+ by
+skipping the package gracefully instead of failing. On 3.13+, SSMForge uses a
+pure-PyTorch SSM fallback (slower, no CUDA acceleration) without you needing
+to do anything special.
+
+### Optional: native Mamba2 CUDA kernels
+
+**SSMForge does NOT include `[mamba]` in its install extras anymore** (as of
+v0.1.1). The `mamba-ssm` package only ships prebuilt wheels for Python 3.9–
+3.12, so forcing it into the install broke Python 3.13+ users. SSMForge
+works without it using a pure-PyTorch SSM fallback.
+
+If you're on Python 3.9, 3.10, 3.11, or 3.12 and want the real CUDA kernels:
+
+```bash
+pip install mamba-ssm causal-conv1d --no-build-isolation
+```
+
+If that command fails on your system, skip it — the fallback works.
 
 ### Step 5 — Install `llama-quantize` (for non-F16 quantization)
 
@@ -434,16 +458,21 @@ export LLAMA_QUANTIZE_BIN="/path/to/llama-quantize"
 
 ### `ImportError: mamba-ssm package required`
 
-You tried to run Stage 3+ without `mamba-ssm`. Either:
+**Note:** SSMForge does NOT raise this error. It has a pure-PyTorch SSM fallback
+that activates automatically when `mamba-ssm` isn't installed. You will see a
+pure-PyTorch SSM layer (slower, no CUDA acceleration) — the package runs fine.
+
+If you want the real CUDA Mamba2 (Python 3.9–3.12 only):
 
 ```bash
-pip install "ssmforge[mamba]"      # add mamba-ssm
-# OR
-pip install ssmforge                # skip mamba, use the fallback
+pip install "ssmforge[export,mamba]"
+# Or manually:
+pip install mamba-ssm causal-conv1d --no-build-isolation
 ```
 
-The pure-PyTorch fallback works but is much slower and doesn't benefit from
-Mamba2's CUDA kernels.
+If you only have Python 3.13+ available, the real CUDA Mamba is not currently
+installable. Use the fallback (default behavior) or set up Python 3.11/3.12 in
+a separate venv.
 
 ### `OSError: fake is not a local folder and is not a valid model identifier`
 
