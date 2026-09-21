@@ -1,0 +1,31 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Local secrets / configs
+.env
+.env.local
+*.local.yaml
+
+# Test artifacts
+tests/fixtures/llama-1b-tiny/*.safetensors
+tests/fixtures/llama-1b-tiny/*.bin
+coverage/
+htmlcov/
+
+# Output examples (keep .gitkeep)
+out/
+*.gguf
