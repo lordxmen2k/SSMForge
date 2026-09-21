@@ -18,8 +18,10 @@ from ssmforge.models.hybrid_llama_mamba import (
 )
 
 
-def _build_fake_llama_state_dict(hidden: int, n_layers: int, vocab: int):
+def _build_fake_llama_state_dict(hidden: int, n_layers: int, vocab: int, intermediate: int | None = None):
     """Construct a complete Llama-shaped state dict with random tensors."""
+    if intermediate is None:
+        intermediate = hidden * 4
     sd = {
         "model.embed_tokens.weight": torch.randn(vocab, hidden),
         "model.norm.weight": torch.ones(hidden),
@@ -28,7 +30,7 @@ def _build_fake_llama_state_dict(hidden: int, n_layers: int, vocab: int):
     for i in range(n_layers):
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             sd[f"model.layers.{i}.self_attn.{proj}.weight"] = torch.randn(hidden, hidden)
-        inter = hidden * 4
+        inter = intermediate
         sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.randn(hidden, inter)
@@ -38,16 +40,21 @@ def _build_fake_llama_state_dict(hidden: int, n_layers: int, vocab: int):
 
 
 def test_smoke_conversion_tiny_model():
-    """Build a tiny hybrid model from a fake Llama state dict and forward it."""
+    """Build a tiny hybrid model from a fake Llama state dict and forward it.
+    Uses a non-default intermediate_size to catch shape bugs like the
+    TinyLlama 5632 vs 8192 mismatch that v0.1.0/v0.1.1 hit in production.
+    """
     hidden = 256
     n_layers = 8
     n_heads = 4
     vocab = 100
+    # Non-default ratio (TinyLlama-style 2.75x). Must be propagated to SSM layers.
+    intermediate = int(hidden * 2.75)
 
     cfg = HybridLlamaMambaConfig(
         vocab_size=vocab,
         hidden_size=hidden,
-        intermediate_size=hidden * 4,
+        intermediate_size=intermediate,
         num_hidden_layers=n_layers,
         num_attention_heads=n_heads,
         num_key_value_heads=n_heads,
@@ -56,7 +63,7 @@ def test_smoke_conversion_tiny_model():
     model = HybridLlamaMambaModel(cfg)
     print(f"  Mamba backend: {'CUDA Mamba' if _MAMBA_AVAILABLE else 'Pure-PyTorch fallback'}")
 
-    src_sd = _build_fake_llama_state_dict(hidden, n_layers, vocab)
+    src_sd = _build_fake_llama_state_dict(hidden, n_layers, vocab, intermediate=intermediate)
     src_sd["_hidden_size"] = hidden
 
     plan = [

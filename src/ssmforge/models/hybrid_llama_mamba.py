@@ -104,7 +104,7 @@ class HybridMamba2Layer(nn.Module):
     Keeps the FFN (MLP) from LlamaDecoderLayer so converted MLP weights load.
     """
 
-    def __init__(self, hidden_size: int, expand: int = 2):
+    def __init__(self, hidden_size: int, intermediate_size: int, expand: int = 2):
         super().__init__()
         if _MAMBA_AVAILABLE:
             self.mamba = Mamba2(
@@ -121,8 +121,10 @@ class HybridMamba2Layer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(hidden_size, eps=1e-5)
         self.post_attention_layernorm = LlamaRMSNorm(hidden_size, eps=1e-5)
         # Reuse Llama's standard MLP. Importing here to avoid circular import at module load.
+        # intermediate_size is taken from the source model — not hardcoded — so
+        # non-default ratios (e.g. TinyLlama 5632/2048 = 2.75) work.
         from transformers.models.llama.modeling_llama import LlamaMLP
-        self.mlp = LlamaMLP(_FakeLlamaConfig(hidden_size))
+        self.mlp = LlamaMLP(_FakeLlamaConfig(hidden_size, intermediate_size))
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         # SSM block
@@ -142,9 +144,9 @@ class _FakeLlamaConfig:
     """Minimal duck-typed config for LlamaMLP that supplies the attrs the
     transformers LlamaMLP constructor reads.
     """
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int):
         self.hidden_size = hidden_size
-        self.intermediate_size = hidden_size * 4  # Llama default ratio
+        self.intermediate_size = intermediate_size  # take from source, not hardcoded
         self.hidden_act = "silu"
         self.mlp_bias = False  # Llama default
 
@@ -165,6 +167,7 @@ class HybridLlamaMambaModel(LlamaForCausalLM):
                 new_layers.append(
                     HybridMamba2Layer(
                         hidden_size=self.config.hidden_size,
+                        intermediate_size=self.config.intermediate_size,
                         expand=self.config.ssm_expand,
                     )
                 )
