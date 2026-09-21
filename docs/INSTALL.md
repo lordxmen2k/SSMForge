@@ -166,7 +166,28 @@ pip install llama-cpp-python
 which llama-quantize   # should print a path
 ```
 
-**Option B — build llama.cpp from source:**
+**Option B — build our vendored llama.cpp fork (with ssmforge arch support):**
+
+The vendored llama.cpp fork at `vendor/llama.cpp/` (lordxmen2k/ssmforge-llama.cpp)
+is registered as a git submodule. It has the `LLM_ARCH_SSMFORGE` arch metadata so
+its `llama-quantize` will accept ssmforge-generated GGUFs without the "unknown
+architecture" error:
+
+```bash
+# Initialize the submodule if you haven't already
+git submodule update --init --recursive
+
+# Build just the tools we need (CPU-only by default; add --cuda for NVIDIA)
+bash scripts/build_vendor.sh           # CPU-only
+bash scripts/build_vendor.sh --cuda    # NVIDIA GPU (CUDA)
+bash scripts/build_vendor.sh --metal   # Apple Silicon
+
+# The binary lives at vendor/llama.cpp/build/bin/llama-quantize
+# SSMForge finds it automatically. No env var needed.
+ls vendor/llama.cpp/build/bin/llama-quantize
+```
+
+**Option C — build upstream llama.cpp from source (no ssmforge arch):**
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp.git
@@ -180,9 +201,10 @@ echo 'export LLAMA_QUANTIZE_BIN="'"$(pwd)"'/build/bin/llama-quantize"' >> ~/.bas
 SSMForge finds the binary in this order:
 
 1. `$LLAMA_QUANTIZE_BIN` environment variable
-2. `llama-quantize` on `$PATH`
+2. `vendor/llama.cpp/build/bin/llama-quantize` (vendored fork's build)
+3. `llama-quantize` on `$PATH`
 
-If neither is set, you'll see an actionable `LlamaQuantizeNotFoundError` when you
+If none is found, you'll see an actionable `LlamaQuantizeNotFoundError` when you
 try to quantize to anything other than F16.
 
 ### Step 6 — (Optional) Mamba CUDA acceleration
