@@ -21,7 +21,7 @@ class LlamaToHybridConverter(ArchitectureConverter):
         target: dict = {}
 
         for key, value in src.items():
-            if "layers." not in key:
+            if "layers." not in key and not key.startswith("_"):
                 target[key] = value
 
         hidden_size = src.get("_hidden_size", 2048)
