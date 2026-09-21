@@ -3,8 +3,15 @@ from ssmforge.converters.base import (
     ArchitectureConverterRegistry,
 )
 from ssmforge.converters.llama_to_hybrid import LlamaToHybridConverter
+from ssmforge.converters.mistral_to_hybrid import MistralToHybridConverter
 
-# Auto-register built-in converters
-ArchitectureConverterRegistry.register("llama", LlamaToHybridConverter)
+# Trigger registration via direct import (registers on import via module-level code)
+import ssmforge.converters.llama_to_hybrid  # noqa: F401
+import ssmforge.converters.mistral_to_hybrid  # noqa: F401
 
-__all__ = ["ArchitectureConverter", "ArchitectureConverterRegistry", "LlamaToHybridConverter"]
+__all__ = [
+    "ArchitectureConverter",
+    "ArchitectureConverterRegistry",
+    "LlamaToHybridConverter",
+    "MistralToHybridConverter",
+]

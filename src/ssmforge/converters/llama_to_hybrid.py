@@ -9,7 +9,7 @@ For MVP: produces a target state dict where:
 from __future__ import annotations
 
 from ssmforge.config import LayerSpec, LayerType
-from ssmforge.converters.base import ArchitectureConverter
+from ssmforge.converters.base import ArchitectureConverter, ArchitectureConverterRegistry
 from ssmforge.converters.weight_init import init_mamba2_from_attention
 
 
@@ -55,3 +55,7 @@ class LlamaToHybridConverter(ArchitectureConverter):
                     target[f"model.layers.{layer_idx}.mamba.{mk}"] = mv
 
         return target
+
+
+# Auto-register on import
+ArchitectureConverterRegistry.register("llama", LlamaToHybridConverter)
