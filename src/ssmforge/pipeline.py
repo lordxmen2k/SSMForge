@@ -61,6 +61,7 @@ def _run_pipeline(
     verify: bool = False,
     dry_run: bool = False,
     experimental: bool = False,
+    no_distill: bool = False,
 ) -> ConversionResult:
     """Execute the pipeline (MVP: Stages 1-3 only)."""
     # Stage 1: Load
@@ -113,6 +114,12 @@ def _run_pipeline(
     if dry_run:
         return ConversionResult(gguf_path=None, manifest_path=None, stats=stats)
 
+    if no_distill:
+        # Skip Stage 4 entirely — write a fresh state dict without distillation.
+        # Useful when distillation OOMs or segfaults and we just want the GGUF.
+        stats["training_stats"] = {"skipped": True, "reason": "no-distill flag"}
+        # Fall through to Stage 5 (export) without running distillation.
+
     # Stage 4: Distillation (lightweight, in-place mutation of student state dict)
     from ssmforge.distillation.calibration import CalibrationDataLoader
     from ssmforge.distillation.trainer import DistillationTrainer
@@ -137,7 +144,7 @@ def _run_pipeline(
         ssm_layer_indices=[spec.index for spec in plan if spec.layer_type.value == "ssm"],
     )
 
-    if tokenizer is not None:
+    if tokenizer is not None and not no_distill:
         student = HybridLlamaMambaModel(config)
         student.load_state_dict(target_sd, strict=False)
 
@@ -157,6 +164,12 @@ def _run_pipeline(
             stats["training_stats"] = {"final_loss": trainer.evaluate_loss()}
         except Exception as e:
             stats["training_stats"] = {"error": str(e), "skipped": True}
+    elif no_distill:
+        # Build the student but skip training. Needed so Stage 5 (export) has a model.
+        if tokenizer is not None:
+            student = HybridLlamaMambaModel(config)
+            student.load_state_dict(target_sd, strict=False)
+        stats["training_stats"] = {"skipped": True, "reason": "no-distill flag"}
     else:
         stats["training_stats"] = {"skipped": True, "reason": "no tokenizer"}
 
@@ -172,7 +185,10 @@ def _run_pipeline(
     final_path = output_dir / f"{safe_name}.{recipe.upper().replace('-','')}.{quantize}.gguf"
 
     try:
-        final_sd = {k: v.detach().cpu() for k, v in student.state_dict().items()} if tokenizer else target_sd
+        if 'student' in locals() and student is not None:
+            final_sd = {k: v.detach().cpu() for k, v in student.state_dict().items()}
+        else:
+            final_sd = {k: (v.detach().cpu() if hasattr(v, 'detach') else v) for k, v in target_sd.items()}
         write_f16_gguf(
             model_state_dict=final_sd,
             config=config,
@@ -237,6 +253,7 @@ def convert(
     verify: bool = False,
     dry_run: bool = False,
     experimental: bool = False,
+    no_distill: bool = False,
 ) -> ConversionResult:
     """Convert a pretrained model to a hybrid SSM/attention model + quantized GGUF.
 
@@ -251,4 +268,5 @@ def convert(
         verify=verify,
         dry_run=dry_run,
         experimental=experimental,
+        no_distill=no_distill,
     )

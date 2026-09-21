@@ -31,6 +31,8 @@ def main(argv: list[str] | None = None) -> None:
     convert_p.add_argument("--calibration-data", default=None, help="Calibration data source")
     convert_p.add_argument("--verify", action="store_true", help="Run Stage 6 verification (slow)")
     convert_p.add_argument("--dry-run", action="store_true", help="Plan only, no export")
+    convert_p.add_argument("--no-distill", action="store_true",
+                           help="Skip distillation stage (default: 2-step stub; --no-distill skips it entirely)")
     convert_p.add_argument("--experimental", action="store_true", help="Allow experimental recipes")
     convert_p.add_argument("--strict-verify", action="store_true", help="Promote verify warnings to errors")
     convert_p.add_argument("--debug", action="store_true", help="Show full tracebacks on error")
@@ -55,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
                 verify=args.verify,
                 dry_run=args.dry_run,
                 experimental=args.experimental,
+                no_distill=args.no_distill,
             )
             print(f"GGUF: {result.gguf_path}")
             print(f"Manifest: {result.manifest_path}")
