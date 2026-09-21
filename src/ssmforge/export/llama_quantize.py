@@ -11,12 +11,29 @@ from ssmforge.exceptions import LlamaQuantizeNotFoundError, QuantizationFailedEr
 
 
 def find_llama_quantize_binary() -> Path:
-    """Find the llama-quantize binary via env var or PATH."""
+    """Find the llama-quantize binary via (in order):
+
+    1. LLAMA_QUANTIZE_BIN environment variable
+    2. The vendored llama.cpp build: vendor/llama.cpp/build/bin/llama-quantize
+       (or .exe on Windows)
+    3. On the system PATH
+    """
     env_path = os.environ.get("LLAMA_QUANTIZE_BIN")
     if env_path:
         p = Path(env_path)
         if p.exists():
             return p
+
+    # Check vendored build (the one users will have if they ran scripts/build_vendor.sh)
+    repo_root = Path(__file__).resolve().parents[3]  # src/ssmforge/export/llama_quantize.py
+    vendored_candidates = [
+        repo_root / "vendor" / "llama.cpp" / "build" / "bin" / "llama-quantize",
+        repo_root / "vendor" / "llama.cpp" / "build" / "bin" / "llama-quantize.exe",
+        repo_root / "vendor" / "llama.cpp" / "build" / "bin" / "Release" / "llama-quantize.exe",
+    ]
+    for cand in vendored_candidates:
+        if cand.exists():
+            return cand
 
     on_path = shutil.which("llama-quantize")
     if on_path:
