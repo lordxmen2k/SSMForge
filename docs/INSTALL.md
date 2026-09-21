@@ -23,6 +23,10 @@ just you, a Python venv, and `twine`.
 
 ## Quick install
 
+> **Important:** the `[mamba]` extra only installs `mamba-ssm` on Python
+> 3.9–3.12 (where prebuilt wheels exist). On 3.13+ SSMForge uses a
+> pure-PyTorch fallback.
+
 For users who just want to **run** SSMForge (not develop it):
 
 ```bash
@@ -36,7 +40,10 @@ source .venv/bin/activate           # Linux/macOS
 python -m pip install --upgrade pip
 python -m pip config set global.index-url https://pypi.org/simple/
 
-# 3. Install SSMForge with the export extra
+# 3. Install SSMForge
+#    Python 3.9–3.12: gets real CUDA Mamba
+pip install "ssmforge[export,mamba]"
+#    Python 3.13+: gets pure-PyTorch fallback (works fine, just slower)
 pip install "ssmforge[export]"
 ```
 

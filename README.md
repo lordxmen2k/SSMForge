@@ -161,7 +161,21 @@ get real numbers for your model.
 
 ## Install
 
-### Quick install
+> **Important:** the `[mamba]` extra only installs `mamba-ssm` on Python
+> 3.9–3.12. On 3.13+ SSMForge uses a pure-PyTorch fallback. See the
+> [Choose your scenario](#choose-your-scenario) section below.
+
+### Quick install (Python 3.9–3.12 with CUDA Mamba)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install "ssmforge[export,mamba]"
+ssmforge --help
+```
+
+### Quick install (Python 3.13+, pure-PyTorch fallback)
 
 ```bash
 python3 -m venv .venv
@@ -170,6 +184,9 @@ python -m pip install --upgrade pip
 pip install "ssmforge[export]"
 ssmforge --help
 ```
+
+The fallback works fine for 1B models. For 3B+ models the CUDA-accelerated
+`[mamba]` extra on Python 3.10–3.12 is meaningfully faster.
 
 ### Full install (with `llama-quantize` for Q4_K_M and friends)
 
@@ -194,20 +211,110 @@ pip install llama-cpp-python
 
 ### Optional: native Mamba2 CUDA kernels
 
-The `[mamba]` extra is gated to **Python 3.9–3.12 only** (where `mamba-ssm`
-ships prebuilt wheels). On Python 3.13+ the extra installs nothing and SSMForge
-uses a pure-PyTorch fallback SSM layer (slower, no CUDA acceleration).
+### Choose your scenario
+
+The `[mamba]` extra installs `mamba-ssm` and `causal-conv1d` — the real
+CUDA-accelerated Mamba2 kernels. **Prebuilt wheels exist only for Python
+3.9–3.12**, so the install path differs by Python version. The `[export]`
+extra (which installs `gguf` for GGUF file writing) works on all Python
+versions.
+
+Pick your scenario and run the matching command:
+
+#### Scenario A — Python 3.9, 3.10, 3.11, or 3.12 (recommended for CUDA Mamba)
+
+You get the real CUDA-accelerated Mamba2 kernels.
 
 ```bash
-# Python 3.9, 3.10, 3.11, or 3.12 — gets real CUDA Mamba
 pip install "ssmforge[export,mamba]"
+```
 
-# Python 3.13+ — gets the fallback (works fine, just slower)
+That's it. Verify:
+
+```bash
+pip show mamba-ssm   # should print Name, Version, Summary
+python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
+```
+
+If `pip show mamba-ssm` succeeds, you're on a CUDA-Mamba-enabled install.
+
+#### Scenario B — Python 3.13 or 3.14 (your situation if you're on the latest)
+
+The `[mamba]` extra installs nothing (pip sees the version gate and skips
+`mamba-ssm`). SSMForge uses a pure-PyTorch SSM fallback — works fine, just
+2-3× slower than the real CUDA Mamba. No action needed for a working
+install.
+
+```bash
 pip install "ssmforge[export]"
 ```
 
-If you're on 3.13+ and want real CUDA Mamba later, set up Python 3.11 or 3.12
-in a separate venv and install SSMForge there.
+If you later want the real CUDA Mamba on Python 3.13+, you have two options:
+
+**Option B1 — Try the manual install** (may fail if CUDA toolkit isn't installed):
+
+```bash
+pip install mamba-ssm causal-conv1d --no-build-isolation
+```
+
+If it succeeds, you're done. If it fails with `nvcc not found` or similar,
+you need to install the CUDA toolkit headers (heavy).
+
+**Option B2 — Set up Python 3.11 in a separate venv** (most reliable):
+
+```bash
+# 1. Install Python 3.11 from https://www.python.org/downloads/release/python-31110/
+#    Default Windows path: C:\Python311\
+
+# 2. Create a venv using Python 3.11
+/C/Python311/python.exe -m venv .venv-mamba
+
+# 3. Activate
+source .venv-mamba/Scripts/activate   # Git Bash on Windows
+# .venv-mamba\Scripts\activate       # PowerShell
+
+# 4. Install SSMForge with the [mamba] extra
+python -m pip install --upgrade pip
+pip install "ssmforge[export,mamba]"
+
+# 5. Verify
+pip show mamba-ssm
+python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
+```
+
+Now you have two venvs:
+- `.venv/` (Python 3.14) — SSMForge with pure-PyTorch fallback
+- `.venv-mamba/` (Python 3.11) — SSMForge with real CUDA Mamba
+
+Use `.venv-mamba/` when you want CUDA-accelerated SSM distillation (matters
+more for 3B+ models than for 1B).
+
+#### Scenario C — macOS Apple Silicon (M1/M2/M3)
+
+```bash
+pip install "ssmforge[export]"
+```
+
+`mamba-ssm` has no MPS (Metal) wheels. The pure-PyTorch fallback works on
+Apple Silicon but is slow. For real GPU acceleration on Apple Silicon,
+track https://github.com/state-spaces/mamba/issues for MPS support.
+
+### How to tell which mode you're in
+
+Run this any time:
+
+```bash
+python -c "
+import sys
+from ssmforge.models.hybrid_llama_mamba import _MAMBA_AVAILABLE
+print(f'Python:           {sys.version.split()[0]}')
+print(f'Real CUDA Mamba:  {_MAMBA_AVAILABLE}')
+if not _MAMBA_AVAILABLE:
+    print('  → using pure-PyTorch fallback (slower, no CUDA)')
+else:
+    print('  → using mamba-ssm CUDA kernels (fast)')
+"
+```
 
 ### Verify
 
