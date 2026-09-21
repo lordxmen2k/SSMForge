@@ -32,91 +32,124 @@ GGUF-compatible runtime.
 
 ---
 
-## Why SSMForge?
+## What SSMForge does
 
-Dense transformers hit a **memory wall at long context** — the KV cache grows
-linearly with sequence length. Hybrid Mamba/attention models keep the attention
-where it matters and replace the rest with state-space layers that have **zero
-KV cache overhead**.
+SSMForge implements the recipes and pipeline described in the published
+literature on hybrid SSM/attention models:
 
-The headline numbers, distilled from the MambaInLlama paper (NeurIPS 2024) and
-Jamba (AI21, 2024):
+- **MambaInLlama** (NeurIPS 2024) — recipe for `hybrid-25`
+- **Jamba** (AI21, 2024) — recipe for `hybrid-50`
+- **"Attention to Mamba"** (2025) — recipe for `pure-mamba`
 
-| Context | Llama-3.1-8B dense | hybrid-25 (SSMForge) | Speedup | Memory saved |
-|---------|--------------------|--------------------|---------|--------------|
-| 4K      | 16 GB / 1240 tok/s | 16 GB / 1320 tok/s | 1.07× | 0% |
-| 32K     | 24 GB / 380 tok/s  | 20 GB / 480 tok/s  | 1.26× | 17% |
-| 128K    | 48 GB / 95 tok/s   | 32 GB / 165 tok/s  | **1.74×** | **33%** |
-| 1M      | **OOM (~270 GB)**  | 152 GB / 28 tok/s  | **fits** | **44%** |
+Given a pretrained dense transformer (HuggingFace model id or local path),
+SSMForge:
 
-At **1M context**, a dense 8B needs ~270 GB VRAM and won't fit on a single H100
-node. The hybrid version fits in 2× A100 80GB. At **128K context** (the practical
-ceiling for most apps), you get **1.7× faster inference and 33% less memory** at
-~95-98% of the teacher's quality.
+1. Loads the teacher model
+2. Plans which layers become Mamba2 vs stay as attention (per recipe)
+3. Performs state-dict surgery: copies embeddings/MLP/LayerNorm verbatim,
+   replaces marked attention layers with freshly-initialized Mamba2 weights
+4. Distills the result against the teacher using KL divergence
+5. Exports the final model as a quantized GGUF that loads in llama.cpp
+6. Writes a manifest JSON with provenance (source SHA, recipe, layer mapping,
+   output file SHA)
+
+**The pipeline is real and tested.** 70 unit + integration + property tests
+pass. The CLI works. A real GGUF file is produced and round-trips through
+`gguf-py`. The dry run works on a real HuggingFace model end-to-end.
 
 ---
 
-## Model size & disk comparison
+## What SSMForge doesn't have (yet)
 
-Here are concrete disk-size and quality-cost numbers for converting popular
-open-source models with SSMForge recipes.
+**No benchmark numbers.** The tables below say "TBD" because we haven't run
+a full conversion on a real large model. The qualitative claims (SSM layers
+have no KV cache, so they save memory at long context) are well-established
+in the literature, but **the specific numbers depend on the model, hardware,
+and distillation recipe** and we cannot honestly quote them for SSMForge
+output without measuring.
 
-### Llama-3.1-8B-Instruct (FP16 → GGUF)
+**Specific things we don't know yet:**
+- How much speedup SSMForge's `hybrid-25` gets vs the paper's `hybrid-25` on
+  the same hardware (we use a lightweight `torch.optim` distillation loop,
+  not the paper's full step-wise + DPO recipe)
+- Actual quality retention vs the teacher (MMLU, HellaSwag on a real
+  converted model)
+- Whether `pure-mamba` lands at the paper's reported 60-80% retention or worse
+  with our distillation implementation
 
-Disk size scales with parameter count, not architecture — every recipe keeps the
-same weight count, so disk is determined by quant type alone.
+**To get real numbers:**
 
-| Variant | Recipe | Quant | Disk size | VRAM @ 4K ctx | VRAM @ 128K ctx | VRAM @ 1M ctx | Quality (vs FP16) |
-|---------|--------|-------|-----------|---------------|------------------|---------------|-------------------|
-| Original FP16 weights | — | F16 | ~16 GB | ~16 GB | ~48 GB | **OOM (~270 GB)** | 100% (baseline) |
-| Dense GGUF | — | Q8_0 | ~8.5 GB | ~8.5 GB | ~40 GB | **OOM (~260 GB)** | ~99.9% |
-| Dense GGUF | — | Q5_K_M | ~5.7 GB | ~5.7 GB | ~37 GB | **OOM (~260 GB)** | ~99% |
-| Dense GGUF | — | Q4_K_M | ~4.6 GB | ~4.6 GB | ~36 GB | **OOM (~255 GB)** | ~98% |
-| **hybrid-25 GGUF** | hybrid-25 | Q8_0 | ~8.5 GB | ~8.5 GB | ~31 GB | ~150 GB | ~98% |
-| **hybrid-25 GGUF** | hybrid-25 | Q5_K_M | ~5.7 GB | ~5.7 GB | ~28 GB | ~148 GB | ~96% |
-| **hybrid-25 GGUF** | hybrid-25 | Q4_K_M | ~4.6 GB | ~4.6 GB | **~27 GB** | **~146 GB** | ~94% |
-| **hybrid-50 GGUF** | hybrid-50 | Q4_K_M | ~4.6 GB | ~4.6 GB | **~19 GB** | **~140 GB** | ~90% |
-| **pure-mamba GGUF** (experimental) | pure-mamba | Q4_K_M | ~4.6 GB | ~4.6 GB | **~4.6 GB** (no KV cache) | **~4.6 GB** (no KV cache) | ~60-70% |
+```bash
+# Run a real conversion
+ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
+    --recipe hybrid-25 \
+    --quantize Q4_K_M \
+    --output ./out
 
-The headline: **hybrid-50 at Q4_K_M fits an 8B model at 128K context in ~19 GB** —
-single RTX 4090 / A6000 territory. **Pure-mamba fits an 8B at 1M context in
-~4.6 GB** — single 3060 territory — at significant quality cost.
+# Benchmark the output
+python -c "
+from ssmforge.benchmark import benchmark_long_context
+from transformers import AutoModelForCausalLM, AutoTokenizer
+model = AutoModelForCausalLM.from_pretrained('./out/<model-name>')
+tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.1-8B-Instruct')
+results = benchmark_long_context(model, tokenizer, context_lengths=[4096, 32768, 131072])
+for ctx, stats in results.items():
+    print(f'{ctx:>8}: {stats.get(\"tokens_per_sec\", 0):.1f} tok/s, {stats.get(\"peak_memory_mb\", 0):.1f} MB')
+"
+```
 
-### Llama-3.2-1B-Instruct (FP16 → GGUF)
+PRs with real numbers welcome — that's the highest-value contribution.
 
-The disk size barely changes between recipes — it's dominated by the number of
-weight parameters, which all recipes keep the same. **The real difference is
-runtime memory at long context**, where KV cache dominates and SSM layers have
-zero overhead.
+---
 
-| Variant | Recipe | Quant | Disk size | VRAM @ 4K ctx | VRAM @ 128K ctx | Quality |
-|---------|--------|-------|-----------|---------------|------------------|---------|
-| Original FP16 | — | F16 | ~2.5 GB | ~2.0 GB | ~4.5 GB | 100% |
-| Dense GGUF | — | Q4_K_M | ~700 MB | ~1.0 GB | ~3.5 GB | ~98% |
-| **hybrid-25 GGUF** | hybrid-25 | Q4_K_M | ~700 MB | ~1.0 GB | **~2.5 GB** | ~95% |
-| **hybrid-50 GGUF** | hybrid-50 | Q4_K_M | ~700 MB | ~1.0 GB | **~2.0 GB** | ~90% |
-| **pure-mamba GGUF** (experimental) | pure-mamba | Q4_K_M | ~700 MB | ~1.0 GB | **~1.0 GB** (no KV cache) | ~70% |
+## Disk size (we know this part)
 
-For all variants, disk size scales with parameter count, not architecture. The
-hybrid and pure-mamba variants win at **runtime** because SSM layers don't
-maintain a KV cache during inference.
+Disk size is dominated by parameter count, not architecture. Every recipe
+keeps the same number of weight parameters, so disk size is determined by
+quant type alone.
 
-### What "quality" means
+| Quant | Llama-3.2-1B | Llama-3.1-8B | Llama-3.1-70B |
+|-------|--------------|--------------|---------------|
+| F16   | ~2.5 GB      | ~16 GB       | ~140 GB       |
+| Q8_0  | ~1.3 GB      | ~8.5 GB      | ~75 GB        |
+| Q5_K_M | ~900 MB     | ~5.7 GB      | ~50 GB        |
+| Q4_K_M | ~700 MB     | ~4.6 GB      | ~40 GB        |
+| Q4_K_S | ~600 MB     | ~4.0 GB      | ~35 GB        |
 
-Quality here = the hybrid model's MMLU / HellaSwag / TruthfulQA scores relative
-to the dense FP16 teacher's scores, measured on the LM Evaluation Harness
-standard benchmark suite. Specifically:
+These are computable from parameter count. The disk size of an SSMForge
+GGUF at any quant level will match the dense GGUF at the same quant level
+(because both have the same number of weights).
 
-- **Q4_K_M** is the standard "lossy compression" tier — 4-bit weights, ~98%
-  retention for dense models.
-- **hybrid-25** trades ~3-5% MMLU for ~30% memory savings at long context.
-- **hybrid-50** trades ~5-10% MMLU for ~50% memory savings at long context.
-- **pure-mamba** (experimental, `--experimental` flag required) trades 20-40%
-  MMLU for ~95% memory savings and **the complete elimination of KV cache**.
+---
 
-The benchmark numbers above are **estimates** from the published MambaInLlama
-paper results. Real numbers for your model will land within ±2% of these —
-run `ssmforge convert ... --verify` to measure on your own data.
+## Runtime VRAM at long context (TBD — we haven't measured)
+
+| Variant | Recipe | VRAM @ 4K ctx | VRAM @ 128K ctx | VRAM @ 1M ctx |
+|---------|--------|---------------|------------------|---------------|
+| Llama-3.1-8B dense | — | TBD | TBD | TBD |
+| Llama-3.1-8B hybrid-25 | hybrid-25 | TBD | TBD (expected to be lower than dense) | TBD |
+| Llama-3.1-8B hybrid-50 | hybrid-50 | TBD | TBD | TBD |
+| Llama-3.1-8B pure-mamba | pure-mamba | TBD | TBD (~flat across context, no KV cache) | TBD |
+
+The qualitative claim — SSM recipes use less memory at long context because
+they have fewer KV-cache-producing attention layers — is correct. **The
+specific numbers** depend on the model, batch size, KV cache dtype, and
+distillation-induced differences in the attention layers. We don't have
+SSMForge-specific numbers. Run the benchmark snippet above to get them.
+
+---
+
+## Quality retention (TBD)
+
+| Recipe | Quality vs teacher |
+|--------|--------------------|
+| dense Q4_K_M (baseline) | TBD (typically ~98% for dense models with llama.cpp's quant) |
+| hybrid-25 | TBD (paper claims ~95-98%, our impl unverified) |
+| hybrid-50 | TBD (paper claims ~90-95%, our impl unverified) |
+| pure-mamba | TBD (paper claims ~60-80%, our impl unverified) |
+
+Run `ssmforge convert ... --verify` and benchmark on lm-evaluation-harness to
+get real numbers for your model.
 
 ---
 
@@ -182,7 +215,7 @@ ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
 Output:
 
 ```
-./out/meta-llama_Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf       (~4.6 GB)
+./out/meta-llama_Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf
 ./out/meta-llama_Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.manifest.json
 ```
 
@@ -193,28 +226,18 @@ from pathlib import Path
 from ssmforge import convert
 
 result = convert(
-    source="meta-llama/Llama-3.1-8B-Instruct",  # HF id or local path
+    source="meta-llama/Llama-3.1-8B-Instruct",
     recipe="hybrid-25",                          # hybrid-25 | hybrid-50 | pure-mamba
     quantize="Q4_K_M",                           # F16 | Q8_0 | Q5_K_M | Q4_K_M | Q4_K_S
     output_dir=Path("./out"),
     calibration_data=None,                       # None = built-in default; or path/dataset id
     verify=False,                                # Stage 6 forward-pass sanity check
-    dry_run=False,                               # True = plan + surgery only, no distillation/export
+    dry_run=False,                               # True = plan + surgery only
     experimental=False,                          # True = allow pure-mamba recipe
 )
-
-print(f"GGUF:     {result.gguf_path}")
-print(f"Manifest: {result.manifest_path}")
-print(f"Stats:    {result.stats}")
-print(f"  Layer count: {result.stats['layer_count']}")
-print(f"  SSM count:   {result.stats['ssm_count']}")
-print(f"  Arch:        {result.stats['arch']}")
 ```
 
 ### Example 3: Dry run — plan only, no distillation or export
-
-Useful when you want to see which layers would be replaced before committing to
-a multi-hour distillation run.
 
 ```bash
 ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
@@ -225,9 +248,6 @@ ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
 Prints the full layer mapping and exits in ~10 seconds without writing anything.
 
 ### Example 4: Custom calibration data
-
-By default, SSMForge uses a small built-in text corpus. For best quality, supply
-your own calibration data from a domain that matches your deployment.
 
 ```bash
 ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
@@ -249,9 +269,7 @@ ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
 
 Any HF dataset id with a `text` field works.
 
-### Example 5: Long-context benchmark
-
-Measure peak memory and throughput at increasing context lengths:
+### Example 5: Long-context benchmark (this gives real numbers)
 
 ```python
 from ssmforge.benchmark import benchmark_long_context
@@ -263,7 +281,7 @@ tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
 results = benchmark_long_context(
     model,
     tokenizer,
-    context_lengths=[4_096, 32_768, 131_072, 524_288, 1_048_576],
+    context_lengths=[4_096, 32_768, 131_072],
 )
 for ctx, stats in results.items():
     if "error" in stats:
@@ -274,9 +292,9 @@ for ctx, stats in results.items():
 
 ### Example 6: Pure Mamba (experimental)
 
-Requires `--experimental` flag. Trades significant quality for the complete
-elimination of KV cache — useful for edge deployment and ultra-long-context
-workloads.
+Requires `--experimental` flag. **Expect significant quality loss — the
+research paper reports 60-80% retention vs teacher for the full recipe;
+SSMForge's lightweight distillation impl is unverified.**
 
 ```bash
 ssmforge convert meta-llama/Llama-3.2-1B \
@@ -287,8 +305,6 @@ ssmforge convert meta-llama/Llama-3.2-1B \
 ```
 
 ### Example 7: Custom recipe
-
-Write your own recipe and register it:
 
 ```python
 # my_recipe.py
@@ -320,16 +336,13 @@ class Hybrid75Recipe(Recipe):
 ```
 
 ```bash
-# Use it
 ssmforge convert <model> --recipe hybrid-75 --quantize Q4_K_M --output ./out
 ```
 
 ### Example 8: Load the output in llama.cpp / ollama / LM Studio
 
-The GGUF file SSMForge produces loads in any GGUF-compatible runtime:
-
 ```bash
-# ollama (create a Modelfile referencing the GGUF)
+# ollama
 echo 'FROM ./out/Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf' > Modelfile
 ollama create my-hybrid-model -f Modelfile
 ollama run my-hybrid-model
@@ -337,19 +350,18 @@ ollama run my-hybrid-model
 # llama.cpp
 ./llama-cli -m ./out/Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf -p "Hello!"
 
-# LM Studio
-# Just open the GGUF file in the UI
+# LM Studio — just open the GGUF file in the UI
 ```
 
 ---
 
 ## Recipes
 
-| Recipe | SSM ratio | Quality cost | Best for |
-|--------|-----------|--------------|----------|
-| `hybrid-25` (default, production) | ~25% | ~3-5% MMLU | Production deployments |
-| `hybrid-50` (production) | ~50% (1:1 alternation) | ~5-10% MMLU | Aggressive long-context optimization |
-| `pure-mamba` (experimental) | 100% | ~20-40% MMLU | Edge deployment, ultra-long context |
+| Recipe | SSM ratio | Best for |
+|--------|-----------|----------|
+| `hybrid-25` (default, production) | ~25% | Production deployments |
+| `hybrid-50` (production) | ~50% (1:1 alternation) | Aggressive long-context optimization |
+| `pure-mamba` (experimental, requires `--experimental`) | 100% | Edge deployment, ultra-long context research |
 
 All three preserve the original tokenizer and chat template.
 
@@ -359,8 +371,6 @@ for the full catalog and customization guide.
 ---
 
 ## Architecture
-
-SSMForge runs a 6-stage pipeline:
 
 ```
    ┌─────────────────┐
@@ -399,26 +409,14 @@ for the full design.
 - **Llama** family (1B / 3B / 8B) — `meta-llama/Llama-3.1-*`, `meta-llama/Llama-3.2-*`
 - **Mistral** family — `mistralai/Mistral-7B-*`
 
-Adding new architectures is straightforward — subclass `ArchitectureConverter`,
-register it, and you're done. See [docs/architecture.md](docs/architecture.md#adding-a-new-architecture).
-
----
-
-## Status
-
-🚧 **v0.1.0** — MVP with all 6 stages wired and the full CLI/API surface.
-70 unit + integration + property tests pass. Suitable for production use with
-the `hybrid-25` and `hybrid-50` recipes on supported architectures.
-
-The `pure-mamba` recipe is experimental — quality loss is significant (20-40%
-on benchmarks per the original research). Use it for research or edge deployment,
-not production chat workloads.
+Adding new architectures: subclass `ArchitectureConverter`, register it. See
+[architecture.md on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/architecture.md).
 
 ---
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](https://github.com/lordxmen2k/SSMForge/blob/main/LICENSE).
 
 ## Links
 
