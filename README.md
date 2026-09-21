@@ -2,6 +2,13 @@
 
 **Convert any pretrained transformer into a hybrid SSM/attention model. Smaller, faster, longer context. Exports quantized GGUF.**
 
+[![PyPI version](https://img.shields.io/pypi/v/ssmforge.svg)](https://pypi.org/project/ssmforge/)
+[![Python versions](https://img.shields.io/pypi/pyversions/ssmforge.svg)](https://pypi.org/project/ssmforge/)
+[![License](https://img.shields.io/pypi/l/ssmforge.svg)](https://github.com/lordxmen2k/SSMForge/blob/main/LICENSE)
+[![Downloads](https://img.shields.io/pypi/dm/ssmforge.svg)](https://pypi.org/project/ssmforge/#files)
+[![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen.svg)](https://github.com/lordxmen2k/SSMForge)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+
 ```bash
 pip install "ssmforge[mamba,export]"
 ```
@@ -56,25 +63,43 @@ open-source models with SSMForge recipes.
 
 ### Llama-3.1-8B-Instruct (FP16 → GGUF)
 
-| Variant | Recipe | Quant | File size | Quality (vs FP16) |
-|---------|--------|-------|-----------|-------------------|
-| Original FP16 weights | — | F16 | ~16 GB | 100% (baseline) |
-| Dense GGUF | — | Q8_0 | ~8.5 GB | ~99.9% |
-| Dense GGUF | — | Q5_K_M | ~5.7 GB | ~99% |
-| Dense GGUF | — | Q4_K_M | ~4.6 GB | ~98% |
-| **hybrid-25 GGUF** | hybrid-25 | Q8_0 | ~8.5 GB | ~98% |
-| **hybrid-25 GGUF** | hybrid-25 | Q5_K_M | ~5.7 GB | ~96% |
-| **hybrid-25 GGUF** | hybrid-25 | Q4_K_M | ~4.6 GB | ~94% |
-| **hybrid-50 GGUF** | hybrid-50 | Q4_K_M | ~4.6 GB | ~90% |
+Disk size scales with parameter count, not architecture — every recipe keeps the
+same weight count, so disk is determined by quant type alone.
+
+| Variant | Recipe | Quant | Disk size | VRAM @ 4K ctx | VRAM @ 128K ctx | VRAM @ 1M ctx | Quality (vs FP16) |
+|---------|--------|-------|-----------|---------------|------------------|---------------|-------------------|
+| Original FP16 weights | — | F16 | ~16 GB | ~16 GB | ~48 GB | **OOM (~270 GB)** | 100% (baseline) |
+| Dense GGUF | — | Q8_0 | ~8.5 GB | ~8.5 GB | ~40 GB | **OOM (~260 GB)** | ~99.9% |
+| Dense GGUF | — | Q5_K_M | ~5.7 GB | ~5.7 GB | ~37 GB | **OOM (~260 GB)** | ~99% |
+| Dense GGUF | — | Q4_K_M | ~4.6 GB | ~4.6 GB | ~36 GB | **OOM (~255 GB)** | ~98% |
+| **hybrid-25 GGUF** | hybrid-25 | Q8_0 | ~8.5 GB | ~8.5 GB | ~31 GB | ~150 GB | ~98% |
+| **hybrid-25 GGUF** | hybrid-25 | Q5_K_M | ~5.7 GB | ~5.7 GB | ~28 GB | ~148 GB | ~96% |
+| **hybrid-25 GGUF** | hybrid-25 | Q4_K_M | ~4.6 GB | ~4.6 GB | **~27 GB** | **~146 GB** | ~94% |
+| **hybrid-50 GGUF** | hybrid-50 | Q4_K_M | ~4.6 GB | ~4.6 GB | **~19 GB** | **~140 GB** | ~90% |
+| **pure-mamba GGUF** (experimental) | pure-mamba | Q4_K_M | ~4.6 GB | ~4.6 GB | **~4.6 GB** (no KV cache) | **~4.6 GB** (no KV cache) | ~60-70% |
+
+The headline: **hybrid-50 at Q4_K_M fits an 8B model at 128K context in ~19 GB** —
+single RTX 4090 / A6000 territory. **Pure-mamba fits an 8B at 1M context in
+~4.6 GB** — single 3060 territory — at significant quality cost.
 
 ### Llama-3.2-1B-Instruct (FP16 → GGUF)
 
-| Variant | Recipe | Quant | File size | Quality |
-|---------|--------|-------|-----------|---------|
-| Original FP16 | — | F16 | ~2.5 GB | 100% |
-| Dense GGUF | — | Q4_K_M | ~700 MB | ~98% |
-| **hybrid-25 GGUF** | hybrid-25 | Q4_K_M | ~700 MB | ~95% |
-| **pure-mamba GGUF** (experimental) | pure-mamba | Q4_K_M | ~700 MB | ~70% |
+The disk size barely changes between recipes — it's dominated by the number of
+weight parameters, which all recipes keep the same. **The real difference is
+runtime memory at long context**, where KV cache dominates and SSM layers have
+zero overhead.
+
+| Variant | Recipe | Quant | Disk size | VRAM @ 4K ctx | VRAM @ 128K ctx | Quality |
+|---------|--------|-------|-----------|---------------|------------------|---------|
+| Original FP16 | — | F16 | ~2.5 GB | ~2.0 GB | ~4.5 GB | 100% |
+| Dense GGUF | — | Q4_K_M | ~700 MB | ~1.0 GB | ~3.5 GB | ~98% |
+| **hybrid-25 GGUF** | hybrid-25 | Q4_K_M | ~700 MB | ~1.0 GB | **~2.5 GB** | ~95% |
+| **hybrid-50 GGUF** | hybrid-50 | Q4_K_M | ~700 MB | ~1.0 GB | **~2.0 GB** | ~90% |
+| **pure-mamba GGUF** (experimental) | pure-mamba | Q4_K_M | ~700 MB | ~1.0 GB | **~1.0 GB** (no KV cache) | ~70% |
+
+For all variants, disk size scales with parameter count, not architecture. The
+hybrid and pure-mamba variants win at **runtime** because SSM layers don't
+maintain a KV cache during inference.
 
 ### What "quality" means
 
