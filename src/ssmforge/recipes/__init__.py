@@ -13,6 +13,7 @@ from ssmforge.recipes.base import (
 
 # Import built-in recipes to trigger their registration.
 from ssmforge.recipes import hybrid_25  # noqa: F401, E402
+from ssmforge.recipes import hybrid_50  # noqa: F401, E402
 
 __all__ = [
     "Recipe",
