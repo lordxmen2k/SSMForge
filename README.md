@@ -1,97 +1,282 @@
-# SSMForge — `arch`
+# SSMForge
 
-**Architecture analyzer for HuggingFace models.**
+**Standalone architecture analyzer for HuggingFace models.**
 
-Standalone CLI that inspects any HuggingFace model and reports architectural
-quirks that affect conversion, fine-tuning, or downstream loading:
-attention biases, fused QKV / fused gate-up projections, tied embeddings,
-grouped attention (GQA), multi-query attention (MQA), MoE, sliding window,
-LayerScale, soft-capping, partial RoPE, MLP type, norm type.
-
-Outputs structured JSON or Markdown, with `--diff` for comparing two models
-and `ssmforge doctor` for environment info.
-
-[![Tests](https://img.shields.io/badge/tests-50%20passed-brightgreen.svg)](https://github.com/lordxmen2k/SSMForge)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+Inspects any HuggingFace model's architecture quirks — attention biases,
+fused tensors, GQA, MQA, MoE, sliding window, soft-capping, tied
+embeddings, and more — before you commit to a conversion, fine-tune, or
+downstream load.
 
 ```bash
 pip install ssmforge
-
 ssmforge arch Qwen/Qwen2-1.5B-Instruct
 ```
 
-## Features
+- **Source:** https://github.com/lordxmen2k/SSMForge
+- **PyPI:** https://pypi.org/project/ssmforge/
+- **License:** Apache 2.0
+- **Python:** 3.10+
 
-| Feature | Use case |
-|---------|----------|
-| `ssmforge arch MODEL` | Inspect a model, report quirks + compatibility |
-| `ssmforge arch MODEL --format markdown` | GitHub-friendly report (paste into issues/PRs) |
-| `ssmforge arch MODEL --diff OTHER_MODEL` | Compare two architectures field-by-field |
-| `ssmforge doctor` | Print ssmforge + environment info |
+---
 
-## What it detects
+## Contents
 
-| Detector | What it catches | Architectures |
-|----------|-----------------|---------------|
-| `attention_bias` | q/k/v projections have learned bias terms | Qwen2 |
-| `tied_embeddings` | `lm_head` shares storage with `embed_tokens` | Qwen2, Pythia |
-| `fused_qkv` | single `qkv_proj` instead of separate q/k/v | Phi-3 |
-| `fused_gate_up` | single `gate_up_proj` instead of gate+up | Phi-3 |
-| `grouped_attention` (GQA) | K/V projection smaller than Q | Qwen2, Llama-3, Mistral |
-| `mqa` | `kv_heads=1` (multi-query attention) | Falcon, Pythia |
-| `moe` | router + expert tensors present | Mixtral, DeepSeek-MoE |
-| `mlp_type` | SwiGLU / GeLU / GeGLU activation family | across the board |
-| `norm_type` | RMSNorm vs LayerNorm | across the board |
-| `sliding_window` | windowed attention config | Mistral, Gemma |
-| `layer_scale` | learnable per-channel residual scale | Phi-3 |
-| `soft_capping` | logit soft-capping values | Gemma2 |
-| `partial_rope` | partial rotary embedding factor | Command-R |
-| `num_experts` / `moe_top_k` | MoE routing config | Mixtral, DeepSeek-MoE |
-| `rope_theta` | resolves from `rope_theta`, `rope_parameters`, or `rope_scaling` | across the board |
+1. [What ssmforge does](#1-what-ssmforge-does)
+2. [Quickstart (60 seconds)](#2-quickstart-60-seconds)
+3. [Glossary](#3-glossary)
+4. [First-time setup](#4-first-time-setup)
+5. [All commands](#5-all-commands)
+6. [Output formats](#6-output-formats)
+7. [HuggingFace setup](#7-huggingface-setup)
+8. [Cache management](#8-cache-management)
+9. [Python API](#9-python-api)
+10. [Exit codes](#10-exit-codes)
+11. [What it detects (full table)](#11-what-it-detects-full-table)
+12. [Supported architectures](#12-supported-architectures)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Why this exists](#14-why-this-exists)
+15. [Limitations](#15-limitations)
 
-Plus an **interpretive profile** (`family`, `attention_type`, `descriptors`)
-that classifies the model into a known family and lists its traits in
-human-readable form.
+---
 
-## Usage
+## 1. What ssmforge does
 
-### Basic inspection
+`ssmforge arch` looks at a HuggingFace model's **actual weights and config**
+and reports architectural quirks that matter when you try to do anything
+non-trivial with the model:
 
-```bash
-# JSON to stdout + human-readable summary on stderr
-ssmforge arch Qwen/Qwen2-1.5B-Instruct
+- Convert it to another format (GGUF, ONNX, MLX, ...)
+- Fine-tune it (LoRA, full SFT, DPO, ...)
+- Quantize it (GPTQ, AWQ, bitsandbytes, ...)
+- Load it in a different runtime (vLLM, llama.cpp, TGI, ...)
+- Port it to a different architecture family (Mamba, Jamba, RWKV, ...)
 
-# JSON only
-ssmforge arch meta-llama/Llama-3.1-8B --quiet
+When output is gibberish, weights silently drop, or conversion segfaults —
+the source model's quirks are usually the cause. `ssmforge arch` makes them
+visible *before* you spend the next hour finding out the hard way.
 
-# Markdown report (great for GitHub issues)
-ssmforge arch Qwen/Qwen2-1.5B-Instruct --format markdown > report.md
+It does **not** modify the model. It does **not** run inference. It only
+inspects.
 
-# Save to file
-ssmforge arch mistralai/Mistral-7B-v0.1 --output mistral.json --format json
+---
 
-# MoE models exit with code 2 (incompatible)
-ssmforge arch mistralai/Mixtral-8x7B-Instruct-v0.1
-echo "Exit: $?"   # 2
-```
+## 2. Quickstart (60 seconds)
 
-### Comparing two models
+If you already have Python 3.10+ and a working `pip`:
 
 ```bash
-# JSON diff (default)
-ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0
-
-# Markdown diff
-ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --format markdown > diff.md
+pip install ssmforge
+ssmforge doctor                              # confirm install works
+ssmforge arch hf-internal-testing/tiny-random-LlamaForCausalLM
 ```
 
-Useful for:
-- Comparing a fine-tuned model against its base
-- Verifying what a LoRA / merge changed
-- Choosing between two candidate source models
+The first arch command downloads the tiny test model (~50 MB), prints a
+JSON report to stdout and a human summary on stderr. Done.
 
-### Environment info
+For a real model:
+
+```bash
+ssmforge arch Qwen/Qwen2-1.5B-Instruct       # downloads ~3 GB on first run
+```
+
+See [Section 4](#4-first-time-setup) for full setup including HuggingFace
+account and gated models.
+
+---
+
+## 3. Glossary
+
+If a term below is unclear when you encounter it in the output, come back
+here.
+
+| Term | Meaning |
+|------|---------|
+| **Architecture** | The blueprint of the model: how many layers, attention type, MLP type, etc. Examples: `llama`, `qwen2`, `mistral`, `phi3`, `gemma2`, `mixtral`, `falcon`. |
+| **State dict** | A flat dictionary mapping parameter names to tensors. E.g. `{"model.layers.0.self_attn.q_proj.weight": tensor(...), ...}`. This is what's saved in `model.safetensors`. |
+| **Config** | The non-weight side of the model: vocab size, layer count, attention bias flag, etc. Stored in `config.json`. |
+| **HF Hub / HuggingFace** | The website https://huggingface.co where models are hosted. |
+| **HF model id** | The string you pass to `ssmforge arch`, e.g. `Qwen/Qwen2-1.5B-Instruct` — org/owner slash model name. |
+| **Gated model** | A model on HF that requires you to (1) have an HF account, (2) accept the license terms on the model's page, and (3) provide an HF token. Examples: Llama-3, Mistral-7B (some checkpoints), Gemma. |
+| **MHA (Multi-Head Attention)** | Standard attention where each head has its own Q, K, V. `num_attention_heads == num_key_value_heads`. |
+| **GQA (Grouped Query Attention)** | Attention where multiple Q heads share one K/V head. `num_key_value_heads < num_attention_heads`. Saves memory and compute on the K/V side. Used by Llama-2-70B, Llama-3, Mistral, Qwen2. |
+| **MQA (Multi-Query Attention)** | Attention where ALL Q heads share a single K head and single V head. `num_key_value_heads == 1`. Used by Falcon, Pythia, some PaLM variants. |
+| **MoE (Mixture of Experts)** | The model's MLP layers are replaced with N parallel "expert" MLPs, and a router decides which experts to use per token. `num_experts` is the count, `num_experts_per_tok` (or `moe_top_k`) is how many are activated per token. Examples: Mixtral (8 experts, top-2), DeepSeek-MoE. |
+| **Tied embeddings** | The `lm_head` (output projection) shares its weight matrix with `embed_tokens` (input embedding). Saves memory but means you can't independently tweak them. Used by Qwen2, Pythia, Gemma. |
+| **Fused QKV / fused gate-up** | Some models put multiple matrices into one tensor. Phi-3 has a single `qkv_proj.weight` of shape `(q_dim + 2*kv_dim, hidden)` instead of separate `q_proj`, `k_proj`, `v_proj`. Saves memory and is faster on some hardware but you have to slice the tensor to get the individual matrices. |
+| **Attention bias** | Standard attention has no bias on Q/K/V projections. Some models (Qwen2) add a bias term. If your target runtime assumes no bias, you'll silently lose accuracy. |
+| **Sliding window attention** | Each token only attends to the previous N tokens, not the full sequence. Used by Mistral (N=4096) and Gemma2. Different runtime cost than full attention. |
+| **Soft-capping** | Gemma2's trick of clamping logit values (e.g. to ±50) before softmax. Makes training more stable. Has to be implemented in your target runtime or you'll diverge from the reference. |
+| **LayerScale** | A learnable per-channel multiplier applied after attention and MLP residual blocks. Used by Phi-3 and some vision transformers. |
+| **Partial RoPE** | Apply rotary embeddings to only a fraction of the head dimensions. Used by Command-R. |
+| **RoPE (Rotary Position Embedding)** | The way most modern LLMs encode token positions. Configured by `rope_theta` (a base frequency) and optionally `rope_scaling` (e.g. for long-context extensions like YaRN). |
+| **SwiGLU / GeGLU / GeLU** | Different activation functions used in the MLP. SwiGLU is the gated version (`gate_proj * up_proj`) used by Llama, Qwen, Mistral. GeGLU is used by Gemma2. GeLU is the older transformer default. |
+| **RMSNorm vs LayerNorm** | Two ways to normalize activations. RMSNorm is simpler (no mean-centering) and used by most modern LLMs (Llama, Qwen, Mistral, Phi). |
+| **Quirk** | In ssmforge context: any architectural detail that's not in the default Llama config. Could be a fused tensor, a gating decision, a position-encoding variant. The whole point of the tool is to surface quirks. |
+| **Compatibility (issue)** | A quirk the analyzer flags with a severity: `info` (handled transparently), `warning` (may degrade), `error` (blocks). MoE is currently the only `error`. |
+
+---
+
+## 4. First-time setup
+
+If you've never used HuggingFace tools before, here's the full path from
+zero to running `ssmforge arch` on a real model.
+
+### 4.1 Install Python
+
+You need Python 3.10 or newer.
+
+```bash
+# Check
+python --version          # Linux / Mac / Git Bash
+# or
+py --version              # Windows Python Launcher
+```
+
+If you don't have it:
+- Linux: `sudo apt install python3.10` (or use your distro's package manager)
+- macOS: `brew install python@3.12`
+- Windows: download from https://www.python.org/downloads/
+
+### 4.2 Create a virtual environment (recommended)
+
+A venv keeps ssmforge and its dependencies isolated from system Python.
+
+```bash
+# Linux / Mac / Git Bash
+python -m venv .venv
+source .venv/bin/activate
+
+# Windows PowerShell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Windows cmd.exe
+python -m venv .venv
+.venv\Scripts\activate.bat
+```
+
+You should see `(.venv)` in your prompt after activating. From here on,
+`pip install` only affects this venv.
+
+### 4.3 Install ssmforge
+
+```bash
+pip install ssmforge
+```
+
+This pulls in:
+- `transformers` — the HuggingFace model library ssmforge uses to load models
+- `huggingface_hub` — the client for the HuggingFace Hub API
+- `safetensors`, `tokenizers`, `numpy` — transitive dependencies
+
+Verify:
+
+```bash
+ssmforge --help
+ssmforge doctor
+```
+
+The `doctor` command should print ssmforge's version, Python version,
+and the resolved cache directories.
+
+### 4.4 (Optional) Create a HuggingFace account
+
+You need an HF account to:
+- Download gated models (Llama-3, Mistral, Gemma, etc.)
+- Upload your own models
+- Increase download rate limits
+
+If you only need non-gated models (Qwen2, TinyLlama, most Phi-3 variants,
+many community fine-tunes), you can skip this step.
+
+To create an account:
+1. Go to https://huggingface.co/join
+2. Sign up with email or GitHub
+3. Verify your email
+
+### 4.5 (Optional) Generate an HF access token
+
+The token lets `ssmforge arch` authenticate to HF Hub.
+
+1. Go to https://huggingface.co/settings/tokens
+2. Click "New token"
+3. Name it anything (e.g. "ssmforge")
+4. Type: **Read** (you only need to download models)
+5. Click "Generate"
+6. Copy the token — it starts with `hf_...`
+
+Set it as an environment variable:
+
+```bash
+# Linux / Mac / Git Bash
+export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxx
+
+# PowerShell
+$env:HF_TOKEN = "hf_xxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Windows cmd.exe
+set HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+To make it persistent:
+
+```bash
+# Git Bash: append to ~/.bashrc
+echo 'export HF_TOKEN=hf_xxxxxxxxx' >> ~/.bashrc
+source ~/.bashrc
+
+# PowerShell (persistent for current user)
+[Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_xxxxx", "User")
+
+# Linux / Zsh: append to ~/.zshrc
+echo 'export HF_TOKEN=hf_xxxxxxxxx' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Never commit the token to git.** Don't put it in `.env` files inside
+your repo. The env var approach keeps it out of your codebase.
+
+### 4.6 (Optional) Accept gated model licenses
+
+Some models require you to click "Agree and access repository" on their
+HF page before you can download them.
+
+For example, to use Llama-3.1-8B:
+1. Go to https://huggingface.co/meta-llama/Llama-3.1-8B
+2. Log in to your HF account
+3. Fill out the license form (your name, email, agree to Meta's license)
+4. Click "Agree and access repository"
+
+Without this, you'll get an error like:
+
+```
+401 Client Error: Unauthorized for url: https://huggingface.co/...
+Repository Not Found for url: ...
+```
+
+### 4.7 Verify everything works
+
+```bash
+# Tiny test model — no HF account needed, ~50 MB download
+ssmforge arch hf-internal-testing/tiny-random-LlamaForCausalLM
+
+# Real non-gated model
+ssmforge arch Qwen/Qwen2-0.5B-Instruct
+
+# Real gated model (requires HF_TOKEN)
+ssmforge arch meta-llama/Llama-3.1-8B-Instruct
+```
+
+If the third one fails with a 401, you either haven't set `HF_TOKEN`,
+or you haven't accepted the license on the model's HF page.
+
+---
+
+## 5. All commands
+
+### `ssmforge doctor`
+
+Print ssmforge + environment info. Useful for bug reports.
 
 ```bash
 ssmforge doctor
@@ -110,24 +295,80 @@ ssmforge doctor
   huggingface_hub_version: 1.32.0
 ```
 
-Great for bug reports — paste the output into the issue.
+JSON variant:
 
-## Example output (JSON)
+```bash
+ssmforge doctor --format json
+```
+
+### `ssmforge arch MODEL`
+
+The main command. Inspect a HuggingFace model.
+
+```bash
+ssmforge arch <model_id_or_path> [options]
+```
+
+| Flag | Short | Purpose | Default |
+|------|-------|---------|---------|
+| `--output PATH` | `-o` | Write report to this file instead of stdout | stdout |
+| `--format {json,markdown,md}` | `-f` | Output format | `json` |
+| `--quiet` | | Don't print the human-readable summary to stderr; print only the report | stderr summary on |
+| `--diff OTHER_MODEL` | | Compare against another model; prints a diff instead of a single report | none |
+
+**Examples:**
+
+```bash
+# Default: JSON to stdout, summary on stderr
+ssmforge arch Qwen/Qwen2-1.5B-Instruct
+
+# JSON only (pipe-friendly)
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --quiet | jq .quirks
+
+# Markdown to file (great for GitHub issues)
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --format markdown --output report.md
+
+# Compare two models (JSON diff)
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Compare two models (Markdown diff)
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --format markdown --output diff.md
+
+# Local path instead of HF id
+ssmforge arch /path/to/local/model --output local-report.json
+
+# Skip summary (only print JSON)
+ssmforge arch mistralai/Mistral-7B-v0.1 --quiet
+```
+
+### `ssmforge --help`
+
+```bash
+ssmforge --help
+ssmforge arch --help
+```
+
+Use these to see all flags with their descriptions.
+
+---
+
+## 6. Output formats
+
+### 6.1 JSON (default)
+
+JSON goes to stdout. You can pipe it to `jq`, save it to a file, or
+post-process with any tool.
+
+Structure:
 
 ```json
 {
   "model_id": "Qwen/Qwen2-1.5B-Instruct",
   "model_type": "qwen2",
-  "config": {
-    "hidden_size": 1536,
-    "num_hidden_layers": 28,
-    "num_attention_heads": 12,
-    "num_key_value_heads": 2,
-    "rope_theta": 1000000.0,
-    "rope_theta_source": "config.rope_parameters.rope_theta",
-    "tie_word_embeddings": true,
-    "attention_bias": true
-  },
+  "architectures": ["Qwen2ForCausalLM"],
+  "config": { /* relevant config fields */ },
+  "quirks": { /* 15 boolean/value fields */ },
   "profile": {
     "family": "Qwen2 (tied embeddings + attention bias)",
     "attention_type": "GQA",
@@ -135,34 +376,12 @@ Great for bug reports — paste the output into the issue.
     "norm_type": "rms",
     "descriptors": ["dense", "tied-embeddings", "attention-bias", "GQA 6:1"]
   },
-  "quirks": {
-    "attention_bias": true,
-    "tied_embeddings": true,
-    "fused_qkv": false,
-    "fused_gate_up": false,
-    "grouped_attention": true,
-    "mqa": false,
-    "moe": false,
-    "mlp_type": "swiglu",
-    "norm_type": "rms",
-    "sliding_window": null,
-    "layer_scale": false,
-    "soft_capping": {},
-    "partial_rope_factor": null,
-    "num_experts": null,
-    "moe_top_k": null
-  },
   "compatibility": {
     "is_compatible": true,
     "blockers": [],
     "warnings": [],
     "issues": [
-      {"severity": "info", "quirk": "attention_bias",
-       "message": "Model has bias=True on attention q/k/v projections..."},
-      {"severity": "info", "quirk": "tied_embeddings",
-       "message": "Embeddings are tied to the LM head..."},
-      {"severity": "warning", "quirk": "grouped_attention",
-       "message": "K/V projection output dim is smaller than Q's..."}
+      {"severity": "info", "quirk": "attention_bias", "message": "..."}
     ]
   },
   "state_dict_summary": {
@@ -172,131 +391,420 @@ Great for bug reports — paste the output into the issue.
       "embeddings": 1,
       "lm_head": 1,
       "attention_weights": 112,
-      "attention_biases": 84,
-      "mlp_weights": 84,
-      "layer_norms": 56,
-      "final_norm": 1
-    }
+      ...
+    },
+    "param_breakdown": { /* same shape, with parameter counts */ }
   }
 }
 ```
 
-## Example output (human summary on stderr)
-
-```
-SSMForge arch report: Qwen/Qwen2-1.5B-Instruct
-  family:              Qwen2 (tied embeddings + attention bias)
-  attention_type:      GQA
-  mlp_type:            swiglu
-  norm_type:           rms
-
-Model config:
-  hidden_size:         1536
-  num_hidden_layers:   28
-  num_attention_heads: 12
-  num_kv_heads:        2
-  intermediate_size:   8960
-  vocab_size:          151936
-  max_position:        32768
-  rope_theta:          1e+06 (from config.rope_parameters.rope_theta)
-  tie_word_embeddings: True
-  attention_bias:      True
-
-Detected quirks:
-  ✓ attention bias=True
-  ✓ tied embeddings
-  ✗ fused QKV
-  ✗ fused gate/up
-  ✓ GQA
-  ✗ MQA (kv_heads=1)
-  ✗ MoE
-    mlp: swiglu
-    norm: rms
-
-State dict: 339 tensors, 1.78B params
-  embeddings                1 tensors,    233.37M params
-  lm_head                   1 tensors,    233.37M params
-  attention_weights       112 tensors,    154.14M params
-  attention_biases         84 tensors,      57.34K params
-  mlp_weights              84 tensors,      1.16B params
-  layer_norms              56 tensors,      86.02K params
-  final_norm                1 tensors,       1.54K params
-
-Compatibility: OK (no blockers)
-```
-
-## Exit codes
-
-- `0` — analyzed successfully, model is compatible
-- `2` — analyzed successfully, but model is incompatible (currently: MoE)
-- `1` — could not load or analyze the model
-
-## Install
+### 6.2 Markdown
 
 ```bash
-pip install ssmforge
+ssmforge arch MODEL --format markdown
 ```
 
-Requires Python 3.10+. Pulls in `transformers` and `huggingface_hub` for
-loading HF models. See [INSTALL.md](docs/INSTALL.md) for details.
+Produces a GitHub-flavored Markdown document with:
+- Title with model id
+- Profile section (family, attention, MLP, norm, descriptors)
+- Config table
+- Detected-quirks checklist
+- Compatibility issues table
+- State dict breakdown
 
-## Controlling where models are cached
+Designed to paste into GitHub issues, PRs, READMEs, or model cards.
 
-`ssmforge arch` downloads HF models on first use and caches them. By
-default the cache lives at `~/.cache/huggingface/` (Linux/Mac) or
-`%USERPROFILE%\.cache\huggingface\` (Windows). Point it somewhere else
-with the `HF_HOME` environment variable:
+### 6.3 Human summary (stderr)
+
+Whenever you run `ssmforge arch MODEL` without `--quiet` and without
+`--output`, a human-readable summary is printed on stderr. JSON still goes
+to stdout. This lets you do:
 
 ```bash
-# Linux / Mac / Git Bash on Windows
+# See summary + save JSON
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --output report.json
+# stderr: human summary
+# file report.json: JSON
+```
+
+The summary shows profile, model config, detected quirks (with ✓/✗ boxes),
+state dict totals, and compatibility verdict.
+
+---
+
+## 7. HuggingFace setup
+
+### 7.1 What HuggingFace is
+
+HuggingFace (https://huggingface.co) is where most open-weight LLMs live.
+When you give `ssmforge arch` an id like `Qwen/Qwen2-1.5B-Instruct`,
+it's downloading from `huggingface.co/Qwen/Qwen2-1.5B-Instruct`.
+
+### 7.2 What `transformers` is
+
+`transformers` is the Python library that knows how to load many model
+architectures. `ssmforge arch` uses it under the hood to:
+1. Download the model files (`config.json`, `model.safetensors`, ...)
+2. Parse `config.json` into a typed config object
+3. Load the weights into memory as a `state_dict`
+
+You don't need to interact with `transformers` directly to use ssmforge.
+
+### 7.3 Model access tiers
+
+| Tier | Examples | HF account needed? |
+|------|----------|--------------------|
+| Open (no gate) | `Qwen/Qwen2-0.5B-Instruct`, `TinyLlama/TinyLlama-1.1B-Chat-v1.0`, `hf-internal-testing/*`, most Phi-3, most community fine-tunes | No |
+| Gated | `meta-llama/Llama-3.1-8B-Instruct`, `mistralai/Mistral-7B-v0.1`, `google/gemma-2-2b` | Yes + license acceptance + `HF_TOKEN` |
+| Private | Anything in a private org you have access to | Yes + `HF_TOKEN` + org membership |
+
+### 7.4 Setting up for gated models
+
+1. Create an HF account (see [4.4](#44-optional-create-a-huggingface-account))
+2. Generate a token with **Read** scope (see [4.5](#45-optional-generate-an-hf-access-token))
+3. Visit the gated model's HF page and click "Agree and access repository"
+4. Set the token: `export HF_TOKEN=hf_xxxxx`
+5. Try `ssmforge arch <gated-model>`
+
+### 7.5 Common HF errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Repository Not Found` | Wrong id, or private repo you can't access | Check the id; check your token has the right scope |
+| `401 Client Error: Unauthorized` | Gated model, no token, or license not accepted | Set `HF_TOKEN`, accept license on HF page |
+| `403 Forbidden` | Token has wrong scope (e.g. Write only) | Generate a Read-scope token |
+| `429 Too Many Requests` | Rate-limited (anonymous or new account) | Set `HF_TOKEN`, wait, or upgrade to HF Pro |
+| `Could not load model` / `OSError: [Errno 28] No space left` | Cache drive full | Change `HF_HOME` to a bigger drive |
+
+---
+
+## 8. Cache management
+
+### 8.1 Where models get cached
+
+When `ssmforge arch` downloads a model, it stores the files locally so
+the next run is instant.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `HF_HOME` | `~/.cache/huggingface/` (Linux/Mac/Git Bash) / `%USERPROFILE%\.cache\huggingface\` (Windows) | Root for all HF caches |
+| `HF_HUB_CACHE` | `$HF_HOME/hub` | Cache for downloaded model files |
+| `TRANSFORMERS_CACHE` | (older versions only) | Same as `HF_HUB_CACHE` |
+| `HF_TOKEN` | (unset) | Your HF token for gated models |
+
+### 8.2 Why you might want to change `HF_HOME`
+
+The default cache lives on your home drive. On Windows that's usually
+`C:\Users\<you>\.cache\huggingface\` — and `C:` is often a small SSD.
+
+If your home drive is small (or you have a bigger drive elsewhere), point
+`HF_HOME` at it:
+
+```bash
+# Git Bash on Windows, with a G: drive for models
 export HF_HOME=G:/models
-ssmforge arch Qwen/Qwen2-1.5B-Instruct
+mkdir -p G:/models
+ssmforge arch Qwen/Qwen2-0.5B-Instruct
 
 # PowerShell
 $env:HF_HOME = "G:\models"
-ssmforge arch Qwen/Qwen2-1.5B-Instruct
+mkdir G:\models
+ssmforge arch Qwen/Qwen2-0.5B-Instruct
 
 # Persistent across shells
-# PowerShell (admin): setx HF_HOME "G:\models" /M
-# Git Bash / Linux:    echo 'export HF_HOME=G:/models' >> ~/.bashrc
+# PowerShell (admin, system-wide):
+setx HF_HOME "G:\models" /M
+# PowerShell (user, current user):
+[Environment]::SetEnvironmentVariable("HF_HOME", "G:\models", "User")
+# Git Bash / Linux / Zsh:
+echo 'export HF_HOME=G:/models' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-`HF_HOME` is read by the underlying HuggingFace libraries, so this
-controls cache location for `ssmforge arch` AND any other HF tool
-(`transformers`, `huggingface-cli`, etc.). Other useful env vars:
+Models are stored under `$HF_HOME/hub/models--ORG--MODEL/snapshots/<sha>/`.
 
-| Variable | Purpose |
-|----------|---------|
-| `HF_HOME` | Root directory for all HF caches (`hub`, `datasets`, etc.) |
-| `HF_HUB_CACHE` | Cache for downloaded model files only |
-| `TRANSFORMERS_CACHE` | Same as `HF_HUB_CACHE` (older transformers versions) |
-| `HF_TOKEN` | HF API token for gated models (e.g. Llama-3, Mistral) |
+### 8.3 Inspecting the cache
 
-Models cache under `$HF_HOME/hub/models--ORG--MODEL/snapshots/<sha>/`.
+```bash
+ssmforge doctor
+```
 
-## Supported architectures
+Tells you what `HF_HOME` resolves to, whether `HF_TOKEN` is set, and what
+versions of `transformers` and `huggingface_hub` are installed.
 
-ssmforge arch uses `AutoModelForCausalLM.from_pretrained()` under the hood,
-so it supports any architecture in `transformers` (Llama, Qwen, Mistral, Phi,
-Gemma, Mixtral, Falcon, Pythia, GPT-NeoX, and many more).
+### 8.4 Clearing the cache
 
-Tested quirk coverage:
+```bash
+# Linux / Mac / Git Bash
+rm -rf ~/.cache/huggingface/hub/models--*
+# Or just one model
+rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B-Instruct
 
-| Architecture | Quirks detected | Tested |
-|--------------|------------------|--------|
-| Llama, Qwen2 | attention_bias, tied_embeddings, GQA, swiglu, rms | ✓ on Qwen2-0.5B, TinyLlama-1.1B, tiny-random-Llama |
-| Phi-3 | fused QKV, fused gate/up, layer_scale | ✓ (simulated) |
-| Mistral | sliding_window, GQA | ✓ (simulated) |
-| Gemma2 | GeGLU, soft-capping | ✓ (simulated) |
-| Mixtral | MoE (8 experts, top-2) | ✓ (simulated) |
-| Falcon | MQA | ✓ (simulated) |
-| Pythia / GPT-NeoX | MQA, tied_embeddings | ✓ (simulated) |
+# Windows PowerShell
+Remove-Item -Recurse -Force $env:USERPROFILE\.cache\huggingface\hub\models--*
+```
 
-`✓ (simulated)` means the quirk detector is verified against a crafted
-state_dict matching that architecture's key layout. Real model runs use
-the same logic and have been confirmed on the smaller models.
+Clearing the cache doesn't remove anything from HF Hub — it'll just
+re-download next time.
 
-## Why this exists
+### 8.5 Per-test cache (only relevant if you run the test suite)
+
+The ssmforge test suite uses an isolated HF cache at `./tests/.cache/`
+so it doesn't pollute your real model cache. Override with:
+
+```bash
+SSMFORGE_TEST_HF_HOME=/path/to/test/cache python -m pytest tests/
+```
+
+---
+
+## 9. Python API
+
+You can use ssmforge from Python without going through the CLI:
+
+```python
+from ssmforge.analyze import build_report, format_report_json
+from ssmforge.analyze.markdown_render import format_report_markdown
+from transformers import AutoModelForCausalLM
+
+# Load a model
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-1.5B-Instruct")
+
+# Build the report
+report = build_report(
+    model_id="Qwen/Qwen2-1.5B-Instruct",
+    config=model.config,
+    state_dict=dict(model.state_dict()),
+)
+
+# Inspect fields
+print(report["quirks"]["tied_embeddings"])   # True
+print(report["profile"]["family"])            # "Qwen2 (tied embeddings + attention bias)"
+print(report["compatibility"]["is_compatible"])  # True
+
+# Serialize
+print(format_report_json(report))             # JSON string
+print(format_report_markdown(report))         # Markdown string
+
+# Diff two reports
+from ssmforge.analyze import diff_reports
+model2 = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+report2 = build_report(
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    model2.config,
+    dict(model2.state_dict()),
+)
+diff = diff_reports(report, report2)
+print(diff["identical"])                      # False
+for d in diff["differences"]:
+    print(f"{d['field']}: {d['a']!r} -> {d['b']!r}")
+```
+
+The `analyze/` package exposes:
+- `build_report(model_id, config, state_dict)` — main entry point
+- `format_report_json(report)` — JSON serializer
+- `format_report_markdown(report)` — Markdown serializer
+- `render_summary(report)` — human-readable summary (for stderr / logs)
+- `diff_reports(a, b)` — diff two reports
+- `QuirkReport` — dataclass for the raw quirk scan
+- `scan_state_dict(state_dict, config, num_layers)` — lower-level scan
+- `count_state_dict_summary(state_dict)` — tensor breakdown
+
+---
+
+## 10. Exit codes
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `0` | Analyzed successfully, no blockers | Continue with your pipeline |
+| `2` | Analyzed successfully, but model has a blocker | Currently only MoE blocks. Check `compatibility.blockers` in the JSON |
+| `1` | Could not load or analyze the model | Check the error message; usually a network, auth, or path issue |
+
+Use exit codes in shell pipelines:
+
+```bash
+ssmforge arch mistralai/Mixtral-8x7B-Instruct-v0.1 && echo "OK" || echo "BLOCKED"
+```
+
+---
+
+## 11. What it detects (full table)
+
+| Detector | Field in JSON | What it catches | Example architectures |
+|----------|---------------|-----------------|-----------------------|
+| `attention_bias` | `quirks.attention_bias` (bool) | q/k/v projections have learned bias terms | Qwen2 |
+| `tied_embeddings` | `quirks.tied_embeddings` (bool) | `lm_head` shares storage with `embed_tokens` | Qwen2, Pythia, Gemma, many small LMs |
+| `fused_qkv` | `quirks.fused_qkv` (bool) | One `qkv_proj` instead of separate q/k/v | Phi-3 |
+| `fused_gate_up` | `quirks.fused_gate_up` (bool) | One `gate_up_proj` instead of gate + up | Phi-3 |
+| `grouped_attention` | `quirks.grouped_attention` (bool) | K/V projection smaller than Q (GQA) | Qwen2, Llama-3, Mistral, Gemma2 |
+| `mqa` | `quirks.mqa` (bool) | K/V projections output exactly `head_dim` (MQA: kv_heads=1) | Falcon, Pythia |
+| `moe` | `quirks.moe` (bool) | Router + expert tensors present | Mixtral, DeepSeek-MoE |
+| `mlp_type` | `quirks.mlp_type` (str) | SwiGLU / GeGLU / GeLU | All |
+| `norm_type` | `quirks.norm_type` (str) | RMSNorm / LayerNorm | All |
+| `sliding_window` | `quirks.sliding_window` (int or null) | Windowed attention size | Mistral, Gemma2 |
+| `layer_scale` | `quirks.layer_scale` (bool) | Learnable per-channel residual scale | Phi-3 |
+| `soft_capping` | `quirks.soft_capping` (dict) | Logit soft-capping values (attn, final) | Gemma2 |
+| `partial_rope_factor` | `quirks.partial_rope_factor` (float or null) | Partial rotary embedding factor | Command-R |
+| `num_experts` | `quirks.num_experts` (int or null) | MoE expert count | Mixtral (8), DeepSeek (60+) |
+| `moe_top_k` | `quirks.moe_top_k` (int or null) | Tokens-per-step routing count | Mixtral (2), DeepSeek (6+) |
+| `rope_theta` | `config.rope_theta` (float) | RoPE base frequency | All |
+| `rope_theta_source` | `config.rope_theta_source` (str) | Where `rope_theta` was resolved from | transformers 5.x detail |
+| `rope_scaling_type` | `config.rope_scaling_type` (str or null) | Type of long-context scaling, if any | All (optional) |
+
+Plus an **interpretive profile** (`report.profile`) that summarizes
+the model:
+
+```json
+"profile": {
+  "family": "Qwen2 (tied embeddings + attention bias)",
+  "attention_type": "GQA",
+  "mlp_type": "swiglu",
+  "norm_type": "rms",
+  "descriptors": ["dense", "tied-embeddings", "attention-bias", "GQA 6:1"]
+}
+```
+
+`descriptors` is a human-readable list of traits. Use it for sanity
+checks: if a "Qwen2" model doesn't have `"attention-bias"` in its
+descriptors, something is off.
+
+---
+
+## 12. Supported architectures
+
+ssmforge uses `transformers.AutoModelForCausalLM.from_pretrained()` under
+the hood. That means it supports any causal LM architecture in the
+`transformers` library: Llama, Qwen, Mistral, Phi-3, Gemma, Mixtral,
+Falcon, Pythia, GPT-NeoX, StarCoder, DeepSeek, and many more.
+
+### Quirks detector coverage
+
+| Architecture | Quirks detected | Verified by |
+|--------------|-----------------|-------------|
+| Llama, Qwen2 | attention_bias, tied_embeddings, GQA, swiglu, rms | Real runs on Qwen2-0.5B, TinyLlama-1.1B, tiny-random-Llama |
+| Phi-3 | fused_qkv, fused_gate_up, layer_scale | Simulated state_dict |
+| Mistral | sliding_window, GQA | Simulated state_dict |
+| Gemma2 | GeGLU, soft_capping | Simulated state_dict |
+| Mixtral | MoE (8 experts, top-2) | Simulated state_dict |
+| Falcon | MQA | Simulated state_dict |
+| Pythia / GPT-NeoX | MQA, tied_embeddings | Simulated state_dict |
+
+"Simulated state_dict" means the quirk detector is verified against a
+crafted state_dict matching that architecture's key layout. The
+detection logic is the same — it just hasn't been run on real model
+weights for those architectures in CI.
+
+If you spot a quirk being missed on a real model, please open an issue
+at https://github.com/lordxmen2k/SSMForge/issues with the model id and
+the missing quirk.
+
+---
+
+## 13. Troubleshooting
+
+### Installation
+
+**`pip install ssmforge` fails with `ModuleNotFoundError`**
+
+You're probably on Python < 3.10. Check: `python --version`. Upgrade or
+use a newer Python.
+
+**`pip install ssmforge` succeeds but `ssmforge` command not found**
+
+The install put the script in a directory not on your PATH. Activate
+your venv (see [4.2](#42-create-a-virtual-environment-recommended)) or
+check `pip show ssmforge` for the install location.
+
+### Loading the model
+
+**`401 Unauthorized` for a gated model**
+
+You haven't accepted the license on the model's HF page, or `HF_TOKEN`
+isn't set. See [4.5](#45-optional-generate-an-hf-access-token) and
+[4.6](#46-optional-accept-gated-model-licenses).
+
+**`Repository Not Found`**
+
+Wrong id, or you don't have access to a private repo. Go to
+https://huggingface.co/USER/MODEL and check that the URL matches what
+you passed.
+
+**`OSError: [Errno 28] No space left on device`**
+
+Your `HF_HOME` drive is full. Either move `HF_HOME` to a bigger drive
+or clear old models from the cache:
+
+```bash
+# See what's there
+ls -lh $HF_HOME/hub/
+# Remove specific models
+rm -rf $HF_HOME/hub/models--Qwen--Qwen2-1.5B-Instruct
+```
+
+**First run is slow**
+
+Expected. The first `ssmforge arch MODEL` downloads the model. The next
+run is instant because the model is cached.
+
+### Running tests
+
+**`PermissionError: [WinError 5]` from pytest on Windows**
+
+Set `SSMFORGE_BASETEMP` to a directory your user owns:
+
+```bash
+SSMFORGE_BASETEMP=G:/test-tmp python -m pytest tests/
+```
+
+The default config also pins `addopts = "--basetemp=/tmp/pytest-ssmforge"`
+in `pyproject.toml`. If `/tmp` doesn't exist on your system, override it.
+
+**`pytest` hangs collecting tests**
+
+You may have a slow or unavailable cache. The test suite downloads tiny
+test models (a few MB). Override `HF_HOME` for tests:
+
+```bash
+SSMFORGE_TEST_HF_HOME=/tmp/ssmforge-test-cache python -m pytest tests/
+```
+
+### Output looks wrong
+
+**`rope_theta` shows wrong value or `rope_theta_source` is `null`**
+
+Older transformers versions (< 4.45) put `rope_theta` directly in the
+config. Newer versions (≥ 5.0) move it into `rope_parameters`. ssmforge
+checks both. If neither has it, the source will be `null` — that's a
+sign of a malformed config, not a ssmforge bug.
+
+**`Profile.family` says "unknown"**
+
+The `_infer_family` heuristic looks at `config.model_type` and known
+quirk combinations. New architectures we haven't seen will report
+`unknown` until we add them. Open an issue if you see this for a known
+architecture.
+
+### Performance
+
+**Memory usage**
+
+Loading a 7B model in fp16 takes ~14 GB of RAM. ssmforge holds the
+model in memory while building the report. If you're tight on RAM,
+stick to smaller models (under 3B) or use `--quiet` (doesn't help
+memory, but reduces output processing).
+
+ssmforge doesn't currently support loading in 8-bit / 4-bit mode —
+that would require extra dependencies. Open an issue if you need this.
+
+**Speed**
+
+Most of the time is spent downloading and loading the model, not
+analyzing. The quirk scan itself is O(layers + tensors), typically a
+few seconds.
+
+---
+
+## 14. Why this exists
 
 When you do surgery on a HuggingFace model — convert it, fine-tune it,
 quantize it, port it to a different architecture family — the source
@@ -308,6 +816,38 @@ is MoE. None of this is obvious from `config.model_type` alone.
 exactly which quirks your model has — before you spend an hour
 discovering them at inference time.
 
+It's intentionally a **diagnostic only**. It doesn't try to fix
+anything. It just tells you what's going on so you can make an
+informed decision.
+
+---
+
+## 15. Limitations
+
+What ssmforge **does not** do:
+
+- **Inference.** Doesn't generate text. Use `transformers` or `vLLM`.
+- **Modification.** Doesn't convert, quantize, or rewrite anything.
+- **Training.** No fine-tuning, no LoRA, no dataset handling.
+- **Conversion to GGUF / ONNX / MLX / etc.** That's a different tool.
+- **Quantization.** Same.
+- **Loading in 8-bit / 4-bit.** Memory-hungry but straightforward.
+- **Standalone runtime.** Doesn't load the model into a chatbot. Use ollama / vLLM.
+
+The PyPI package has zero PyTorch / GGUF / mamba-ssm dependencies. It's
+intentionally minimal — if you only need to inspect, this is what you
+install.
+
+---
+
+## Contributing
+
+Bug reports and feature requests welcome:
+https://github.com/lordxmen2k/SSMForge/issues
+
+Pull requests: fork the repo, make your change, open a PR. Tests are
+required for new features (`pip install -e ".[dev]" && pytest tests/`).
+
 ## License
 
-Apache 2.0
+Apache 2.0. See `LICENSE`.
