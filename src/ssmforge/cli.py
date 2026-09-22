@@ -200,7 +200,7 @@ def _format_dry_run_summary(report: dict) -> str:
     profile = report.get("profile", {})
 
     lines = []
-    lines.append(f"SSMForge arch DRY-RUN: {report['model_id']}")
+    lines.append(f"SSMForge arch DRY-RUN: {report.get('model_id', '<unknown>')}")
     lines.append(f"  family:              {profile.get('family', '?')}")
     lines.append(f"  attention_type:      {profile.get('attention_type', '?')}")
     lines.append(f"  mlp_type:            {profile.get('mlp_type', '?')}")
@@ -345,6 +345,14 @@ def _quiet_transformers_warnings() -> None:
         for name in ("transformers", "transformers.modeling_utils",
                      "transformers.configuration_utils", "transformers.tokenization_utils_base"):
             logging.getLogger(name).setLevel(logging.ERROR)
+        # The `[transformers] torch_dtype is deprecated` and
+        # `[transformers] pad_token_id must be None` messages bypass
+        # logging (they print directly to stderr via the `warnings`
+        # module or via direct print()). Catch them via warnings too.
+        import warnings as _warnings
+        _warnings.filterwarnings("ignore", category=DeprecationWarning, module="transformers")
+        _warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+        _warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
     except ImportError:
         pass
 

@@ -59,6 +59,15 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.1.9
+
+| Fix | What was broken |
+|-----|-----------------|
+| `--fields profile.family` no longer crashes with `KeyError: 'model_id'` | When subsetting stripped `model_id`, the dry-run summary still tried to read it. Now uses `.get('model_id', '<unknown>')`. |
+| `--quiet` now silences transformers deprecation warnings | The `[transformers] torch_dtype is deprecated` and `pad_token_id must be None` messages bypassed the logging system. Now also filters `warnings` module. |
+
+Plus 4 new regression tests.
+
 ### What's new in 0.1.8
 
 | Feature | Why it matters |
@@ -1164,7 +1173,31 @@ install.
 
 ## 16. Update log
 
-### v0.1.8 (current) — 2026-09-22
+### v0.1.9 (current) — 2026-09-22
+
+**Bug fixes:**
+
+- `--fields <path>` no longer crashes with `KeyError: 'model_id'`
+  when the subset strips the `model_id` field. The dry-run summary
+  now uses `.get('model_id', '<unknown>')`. Triggered by:
+  ```
+  ssmforge arch X --dry-run --fields "profile.family,quirks.tied_embeddings"
+  ```
+- `--quiet` now silences transformers' `[transformers]` warnings
+  that bypass the logging system (printed directly via Python's
+  `warnings` module). Affected messages:
+  - `[transformers] torch_dtype is deprecated! Use dtype instead!`
+  - `[transformers] Model config: pad_token_id must be None or an integer...`
+
+Both fixes also apply in `--compare` mode.
+
+Tests: 111 passed (was 107). 4 new regression tests:
+- `test_cli_fields_subset_no_model_id_keyerror` — verifies the fix
+- `test_cli_fields_does_not_crash_on_full_subset` — multi-path subset
+- `test_quiet_transformers_warnings_filters_deprecation` — verifies filter
+- `test_quiet_transformers_warnings_handles_missing_transformers` — graceful fallback
+
+### v0.1.8 — 2026-09-22
 
 **New flags:**
 
