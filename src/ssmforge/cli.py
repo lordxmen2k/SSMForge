@@ -300,7 +300,11 @@ def main(argv: list[str] | None = None) -> None:
             "LayerScale, soft-capping, partial RoPE, MLP type, and norm type."
         ),
     )
-    arch_p.add_argument("source", help="HF model id or local path")
+    arch_p.add_argument(
+        "source", nargs="?", default=None,
+        help="HF model id or local path. Optional when --compare is used (the "
+             "first model can come from --compare instead).",
+    )
     arch_p.add_argument(
         "--output", "-o", default=None,
         help="Write report to this file (use '-' for stdout). Format chosen by --format.",
@@ -321,6 +325,12 @@ def main(argv: list[str] | None = None) -> None:
         "--dry-run", action="store_true",
         help="Fetch only the config (no weight download). Reports config-only quirks "
              "and memory estimate. Useful as a pre-flight check.",
+    )
+    arch_p.add_argument(
+        "--compare", metavar="MODEL", nargs="+", default=None,
+        help="Compare 2+ models side-by-side. The first model comes from the "
+             "`source` positional (or --compare if source is omitted). Renders "
+             "a multi-model comparison table.",
     )
 
     # ---- doctor subcommand ----
@@ -352,134 +362,101 @@ def _cmd_arch(args) -> None:
     from ssmforge.analyze import (
         build_report,
         build_report_from_config,
+        compare_reports,
         diff_reports,
+        format_compare_markdown,
         format_report_json,
         format_report_markdown,
     )
     from ssmforge.analyze.summary import render_summary
 
-    # Fail fast on missing local paths
-    _check_local_path(args.source)
-    if args.diff:
-        _check_local_path(args.diff)
+    # Resolve the list of models to compare / inspect.
+    # If --compare is given, models = [source?] + args.compare (deduped, preserving order)
+    # If only --diff is given, models = [source, args.diff]
+    # Otherwise models = [source]
+    if args.compare:
+        # Build the full model list: source first (if given), then --compare args
+        all_models = []
+        if args.source:
+            all_models.append(args.source)
+        for m in args.compare:
+            if m not in all_models:
+                all_models.append(m)
+        # Need at least 2 for compare
+        if len(all_models) < 2:
+            print(
+                "Error: --compare requires at least 2 models. "
+                "Pass model ids as arguments after --compare, or "
+                "provide the first as a positional argument.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        args._compare_models = all_models
+    elif args.diff:
+        args._compare_models = [args.source, args.diff]
+    else:
+        args._compare_models = [args.source] if args.source else []
 
-    # Dry-run: config only
-    if args.dry_run:
+    # Fail fast on missing local paths
+    for m in args._compare_models:
+        _check_local_path(m)
+
+    # ---- Multi-model dispatch (compare, diff, single) ----
+    models_to_load = args._compare_models
+    n_models = len(models_to_load)
+
+    # Load all reports
+    reports = []
+    for model_id in models_to_load:
         try:
-            with _arch_load_progress(args.source, dry_run=True) as config:
-                report_a = build_report_from_config(
-                    model_id=args.source,
-                    config=config,
-                )
+            with _arch_load_progress(model_id, dry_run=args.dry_run) as obj:
+                if args.dry_run:
+                    r = build_report_from_config(model_id=model_id, config=obj)
+                else:
+                    r = build_report(
+                        model_id=model_id,
+                        config=obj.config,
+                        state_dict=dict(obj.state_dict()),
+                    )
+            reports.append(r)
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
             sys.exit(130)
         except MemoryError:
-            print(f"Error: out of memory while loading config for {args.source}", file=sys.stderr)
+            print(f"Error: out of memory while loading {model_id}", file=sys.stderr)
+            if not args.dry_run:
+                print("  Try --dry-run to preview without loading weights.", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
-            print(f"Error analyzing {args.source}: {e}", file=sys.stderr)
+            err_name = type(e).__name__
+            msg = str(e)
+            if not args.dry_run and ("memory allocation" in msg.lower() or "out of memory" in msg.lower()):
+                print(f"Error: insufficient memory to load {model_id}", file=sys.stderr)
+                print(f"  Detail: {msg}", file=sys.stderr)
+                print(f"  Try --dry-run to preview without loading weights.", file=sys.stderr)
+                sys.exit(1)
+            print(f"Error analyzing {model_id}: {err_name}: {msg}", file=sys.stderr)
             sys.exit(1)
 
-        # Diff in dry-run mode
-        if args.diff:
-            try:
-                with _arch_load_progress(args.diff, dry_run=True) as config_b:
-                    report_b = build_report_from_config(
-                        model_id=args.diff,
-                        config=config_b,
-                    )
-            except KeyboardInterrupt:
-                print("\nInterrupted.", file=sys.stderr)
-                sys.exit(130)
-            except MemoryError:
-                print(f"Error: out of memory while loading config for {args.diff}", file=sys.stderr)
-                sys.exit(1)
-            except Exception as e:
-                print(f"Error analyzing {args.diff}: {e}", file=sys.stderr)
-                sys.exit(1)
-
-            diff = diff_reports(report_a, report_b)
-            if args.format in ("markdown", "md"):
-                md = _format_diff_markdown(report_a, report_b, diff)
-                _write_or_print(md, args.output)
-            else:
-                import json as json_mod
-                output = {
-                    "model_a": args.source,
-                    "model_b": args.diff,
-                    "identical": diff["identical"],
-                    "differences": diff["differences"],
-                    "added_quirks": diff["added_quirks"],
-                    "removed_quirks": diff["removed_quirks"],
-                }
-                _write_or_print(json_mod.dumps(output, indent=2), args.output)
-            sys.exit(0)
-
-        # Single-model dry-run
+    # Single model
+    if n_models == 1:
+        report_a = reports[0]
         if args.format in ("markdown", "md"):
             output_text = format_report_markdown(report_a)
         else:
             output_text = format_report_json(report_a)
             if not args.quiet and not args.output:
-                print(_format_dry_run_summary(report_a), file=sys.stderr)
+                if args.dry_run:
+                    print(_format_dry_run_summary(report_a), file=sys.stderr)
+                else:
+                    print(render_summary(report_a), file=sys.stderr)
 
         _write_or_print(output_text, args.output)
         sys.exit(0 if report_a["compatibility"]["is_compatible"] else 2)
 
-    # Full mode: load weights
-    try:
-        with _arch_load_progress(args.source, dry_run=False) as model:
-            report_a = build_report(
-                model_id=args.source,
-                config=model.config,
-                state_dict=dict(model.state_dict()),
-            )
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        sys.exit(130)
-    except MemoryError:
-        print(f"Error: out of memory while loading {args.source}", file=sys.stderr)
-        print("  Try --dry-run to preview the model without loading weights,", file=sys.stderr)
-        print("  or set HF_HOME to a different drive.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        err_name = type(e).__name__
-        # Detect the "memory allocation failed" message that Rust-backended
-        # safetensors emits when the model doesn't fit in RAM.
-        msg = str(e)
-        if "memory allocation" in msg.lower() or "out of memory" in msg.lower():
-            print(f"Error: insufficient memory to load {args.source}", file=sys.stderr)
-            print(f"  Detail: {msg}", file=sys.stderr)
-            print(f"  Try --dry-run to preview without loading weights.", file=sys.stderr)
-            sys.exit(1)
-        print(f"Error analyzing {args.source}: {err_name}: {msg}", file=sys.stderr)
-        sys.exit(1)
-
-    # Diff mode
-    if args.diff:
-        try:
-            with _arch_load_progress(args.diff, dry_run=False) as model_b:
-                report_b = build_report(
-                    model_id=args.diff,
-                    config=model_b.config,
-                    state_dict=dict(model_b.state_dict()),
-                )
-        except KeyboardInterrupt:
-            print("\nInterrupted.", file=sys.stderr)
-            sys.exit(130)
-        except MemoryError:
-            print(f"Error: out of memory while loading {args.diff}", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            err_name = type(e).__name__
-            msg = str(e)
-            if "memory allocation" in msg.lower() or "out of memory" in msg.lower():
-                print(f"Error: insufficient memory to load {args.diff}", file=sys.stderr)
-                sys.exit(1)
-            print(f"Error analyzing {args.diff}: {err_name}: {msg}", file=sys.stderr)
-            sys.exit(1)
-
+    # Two models (legacy --diff behavior, preserved for back-compat)
+    if n_models == 2 and not args.compare:
+        report_a, report_b = reports
         diff = diff_reports(report_a, report_b)
         if args.format in ("markdown", "md"):
             md = _format_diff_markdown(report_a, report_b, diff)
@@ -487,8 +464,8 @@ def _cmd_arch(args) -> None:
         else:
             import json as json_mod
             output = {
-                "model_a": args.source,
-                "model_b": args.diff,
+                "model_a": args._compare_models[0],
+                "model_b": args._compare_models[1],
                 "identical": diff["identical"],
                 "differences": diff["differences"],
                 "added_quirks": diff["added_quirks"],
@@ -497,16 +474,25 @@ def _cmd_arch(args) -> None:
             _write_or_print(json_mod.dumps(output, indent=2), args.output)
         sys.exit(0)
 
-    # Single-model full mode
+    # Multi-model comparison (3+ models, or --compare with 2 models)
+    comparison = compare_reports(reports)
     if args.format in ("markdown", "md"):
-        output_text = format_report_markdown(report_a)
+        md = format_compare_markdown(comparison)
+        _write_or_print(md, args.output)
     else:
-        output_text = format_report_json(report_a)
-        if not args.quiet and not args.output:
-            print(render_summary(report_a), file=sys.stderr)
-
-    _write_or_print(output_text, args.output)
-    sys.exit(0 if report_a["compatibility"]["is_compatible"] else 2)
+        import json as json_mod
+        # Add a small header so JSON consumers know it's a comparison
+        output = {
+            "comparison_type": "multi_model",
+            "model_count": len(comparison["models"]),
+            "all_identical": comparison["all_identical"],
+            "identical_field_count": comparison["identical_field_count"],
+            "different_field_count": comparison["different_field_count"],
+            "models": comparison["models"],
+            "fields": comparison["fields"],
+        }
+        _write_or_print(json_mod.dumps(output, indent=2), args.output)
+    sys.exit(0)
 
 
 def _cmd_doctor(args) -> None:

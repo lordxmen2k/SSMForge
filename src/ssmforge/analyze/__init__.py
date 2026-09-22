@@ -33,7 +33,7 @@ from ssmforge.analyze.state_dict_scan import (
 )
 from ssmforge.analyze.summary import render_summary
 from ssmforge.analyze.markdown_render import format_report_markdown
-from ssmforge.analyze.diff import diff_reports
+from ssmforge.analyze.diff import diff_reports, compare_reports, format_compare_markdown
 
 __all__ = [
     "build_report",
@@ -42,6 +42,8 @@ __all__ = [
     "format_report_markdown",
     "render_summary",
     "diff_reports",
+    "compare_reports",
+    "format_compare_markdown",
     "QuirkReport",
     "scan_state_dict",
     "scan_config_only",

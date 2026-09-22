@@ -85,3 +85,109 @@ def diff_reports(report_a: dict, report_b: dict) -> dict:
         "added_quirks": added_quirks,
         "removed_quirks": removed_quirks,
     }
+
+
+def compare_reports(reports: list[dict]) -> dict:
+    """Compare N architecture reports side-by-side.
+
+    Args:
+        reports: list of report dicts, each with 'model_id' field.
+
+    Returns a dict with:
+        - 'models': list of model ids in the same order
+        - 'fields': list of dicts {field, values, all_same, unique_values}
+                    one per field that varies across the N models
+        - 'all_identical': True if every field has the same value across models
+        - 'identical_field_count': number of fields with identical values
+        - 'different_field_count': number of fields with at least one difference
+
+    Useful for:
+    - Comparing a fine-tuned model, its base, and a competitor side by side
+    - Spotting field-level inconsistencies across 3+ checkpoints of the same
+      model
+    - Generating a comparison table for a paper or wiki
+    """
+    if len(reports) < 2:
+        raise ValueError(
+            f"compare_reports requires at least 2 reports, got {len(reports)}"
+        )
+
+    model_ids = [r.get("model_id", f"model_{i}") for i, r in enumerate(reports)]
+    flat_reports = [_flatten_quirks(r) for r in reports]
+
+    # Collect all fields across all reports (union)
+    all_fields = set()
+    for fr in flat_reports:
+        all_fields.update(fr.keys())
+
+    fields = []
+    identical_count = 0
+    for field in sorted(all_fields):
+        values = {model_ids[i]: fr.get(field) for i, fr in enumerate(flat_reports)}
+        unique_values = list(dict.fromkeys(values.values()))  # preserve order
+        all_same = len(unique_values) == 1
+        if all_same:
+            identical_count += 1
+        fields.append({
+            "field": field,
+            "values": values,
+            "all_same": all_same,
+            "unique_values": unique_values,
+        })
+
+    return {
+        "models": model_ids,
+        "fields": fields,
+        "all_identical": identical_count == len(fields),
+        "identical_field_count": identical_count,
+        "different_field_count": len(fields) - identical_count,
+    }
+
+
+def format_compare_markdown(comparison: dict) -> str:
+    """Render an N-way comparison as a Markdown table."""
+    models = comparison["models"]
+    fields = comparison["fields"]
+
+    lines = []
+    lines.append(f"# Architectural comparison: {len(models)} models")
+    lines.append("")
+
+    if comparison["all_identical"]:
+        lines.append("**All identical** — every field matches across all models.")
+        lines.append("")
+        lines.append(f"Models compared: {', '.join(f'`{m}`' for m in models)}")
+        return "\n".join(lines)
+
+    lines.append(
+        f"**{comparison['different_field_count']} field(s) differ** "
+        f"out of {len(fields)}; "
+        f"{comparison['identical_field_count']} identical."
+    )
+    lines.append("")
+
+    # Build header row
+    header = "| Field | " + " | ".join(models) + " |"
+    sep = "|-------|" + "|".join(["-------"] * len(models)) + "|"
+    lines.append(header)
+    lines.append(sep)
+
+    # Body rows
+    for field in fields:
+        if field["all_same"]:
+            continue  # skip identical rows to keep the table scannable
+        vals = [str(field["values"][m]) for m in models]
+        lines.append(f"| `{field['field']}` | " + " | ".join(f"`{v}`" for v in vals) + " |")
+
+    # Section listing the identical fields for completeness
+    identical_fields = [f["field"] for f in fields if f["all_same"]]
+    if identical_fields:
+        lines.append("")
+        lines.append(f"### Identical across all models")
+        lines.append("")
+        lines.append(f"{len(identical_fields)} field(s) had the same value: "
+                     + ", ".join(f"`{f}`" for f in identical_fields[:20]))
+        if len(identical_fields) > 20:
+            lines.append(f"  (and {len(identical_fields) - 20} more)")
+
+    return "\n".join(lines)

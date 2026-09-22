@@ -59,6 +59,17 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.1.7
+
+| Feature | Why it matters |
+|---------|----------------|
+| `ssmforge arch --compare A B C D` | N-way model comparison. Side-by-side table of every field across all models. JSON or Markdown. |
+| `ssmforge arch MODEL --compare B C D` | First model from positional, rest from `--compare`. |
+| `--compare` works with `--dry-run` | Compare configs without downloading any weights. |
+| Legacy `--diff` still works | Same one-vs-one behavior, fully back-compat. |
+
+Plus 11 new tests (91 total).
+
 ### What's new in 0.1.6
 
 | Feature | Why it matters |
@@ -360,7 +371,8 @@ ssmforge arch <model_id_or_path> [options]
 | `--output PATH` | `-o` | Write report to this file (use `-` for stdout) | stdout |
 | `--format {json,markdown,md}` | `-f` | Output format | `json` |
 | `--quiet` | | Don't print the human-readable summary to stderr; print only the report | stderr summary on |
-| `--diff OTHER_MODEL` | | Compare against another model; prints a diff instead of a single report | none |
+| `--diff OTHER_MODEL` | | Compare against one other model (legacy, use `--compare` for 3+) | none |
+| `--compare MODEL [MODEL ...]` | | Compare 2+ models side-by-side. First model can come from positional. | none |
 | `--dry-run` | | Fetch only the config (no weight download); reports config-only quirks + memory estimate | full load |
 
 **Examples:**
@@ -375,12 +387,20 @@ ssmforge arch Qwen/Qwen2-1.5B-Instruct --quiet | jq .quirks
 # Markdown to file (great for GitHub issues)
 ssmforge arch Qwen/Qwen2-1.5B-Instruct --format markdown --output report.md
 
-# Compare two models (JSON diff)
+# Compare two models (JSON diff, legacy syntax still works)
 ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
-# Compare two models (Markdown diff)
-ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --format markdown --output diff.md
+# Compare 2+ models (NEW: side-by-side table)
+ssmforge arch --compare Qwen/Qwen2-0.5B-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --format markdown
+
+# Compare 3 models (small + base + finetune)
+ssmforge arch --compare tiny-random-Llama Qwen/Qwen2-0.5B-Instruct TinyLlama \
+  --dry-run --format markdown
+
+# Combine: compare with positional + --compare list
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --compare TinyLlama/TinyLlama \
+  --diff would-be-redundant-but-fine
 
 # Local path instead of HF id
 ssmforge arch /path/to/local/model --output local-report.json
@@ -388,6 +408,54 @@ ssmforge arch /path/to/local/model --output local-report.json
 # Skip summary (only print JSON)
 ssmforge arch mistralai/Mistral-7B-v0.1 --quiet
 ```
+
+### Comparing 2+ models (`--compare`)
+
+The `--compare` flag takes 2 or more model ids and renders a multi-model
+table showing every field's value across all models. Fields that match
+across all models are listed in an "Identical across all models" section
+at the bottom (not in the table) to keep the table scannable.
+
+```bash
+ssmforge arch --compare Qwen/Qwen2-0.5B-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --dry-run --format markdown
+```
+
+Output:
+
+```markdown
+# Architectural comparison: 2 models
+
+**10 field(s) differ** out of 27; 17 identical.
+
+| Field | Qwen/Qwen2-0.5B-Instruct | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |
+|-------|-------|-------|
+| `grouped_attention` | `True` | `True` |
+| `hidden_size` | `896` | `2048` |
+| `model_type` | `qwen2` | `llama` |
+| `num_attention_heads` | `14` | `32` |
+| `rope_theta` | `1000000.0` | `10000.0` |
+| `tie_word_embeddings` | `True` | `False` |
+| `vocab_size` | `151936` | `32000` |
+...
+
+### Identical across all models
+17 field(s) had the same value: `attention_bias`, `attention_bias_in_state_dict`, ...
+```
+
+Useful for:
+
+- Comparing a fine-tuned model, its base, and a competitor side by side
+- Spotting field-level inconsistencies across 3+ checkpoints of the same model
+- Generating comparison tables for papers / model cards / wiki pages
+- Validating that a LoRA / merge didn't accidentally change architecture
+
+Both JSON and Markdown output work. JSON has every field with all
+values, plus summary counts (`identical_field_count`, `different_field_count`).
+
+Note: `--diff` (one-vs-one) is still supported and unchanged for
+back-compat. `--compare A B` produces the same output as `--diff B`
+when given via positional `A --compare B`.
 
 ### Pre-flight check (no weight download)
 
@@ -718,7 +786,7 @@ print(format_report_json(report))             # JSON string
 print(format_report_markdown(report))         # Markdown string
 
 # Diff two reports
-from ssmforge.analyze import diff_reports
+from ssmforge.analyze import diff_reports, compare_reports
 model2 = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 report2 = build_report(
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -729,6 +797,21 @@ diff = diff_reports(report, report2)
 print(diff["identical"])                      # False
 for d in diff["differences"]:
     print(f"{d['field']}: {d['a']!r} -> {d['b']!r}")
+
+# Compare 3+ models
+model3 = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-LlamaForCausalLM")
+report3 = build_report(
+    "tiny-random",
+    model3.config,
+    dict(model3.state_dict()),
+)
+cmp = compare_reports([report, report2, report3])
+print(cmp["all_identical"])                   # False
+print(f"{cmp['different_field_count']} fields differ out of {len(cmp['fields'])}")
+# Iterate only the differing fields
+for f in cmp["fields"]:
+    if not f["all_same"]:
+        print(f"{f['field']}: {f['values']}")
 ```
 
 The `analyze/` package exposes:
@@ -737,6 +820,8 @@ The `analyze/` package exposes:
 - `format_report_markdown(report)` — Markdown serializer
 - `render_summary(report)` — human-readable summary (for stderr / logs)
 - `diff_reports(a, b)` — diff two reports
+- `compare_reports(reports_list)` — N-way comparison of 2+ reports
+- `format_compare_markdown(comparison)` — render a comparison as a Markdown table
 - `QuirkReport` — dataclass for the raw quirk scan
 - `scan_state_dict(state_dict, config, num_layers)` — lower-level scan
 - `count_state_dict_summary(state_dict)` — tensor breakdown
@@ -1013,7 +1098,40 @@ install.
 
 ## 16. Update log
 
-### v0.1.6 (current) — 2026-09-22
+### v0.1.7 (current) — 2026-09-22
+
+**New feature: N-way model comparison via `--compare`**
+
+```bash
+ssmforge arch --compare Qwen/Qwen2-0.5B-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0
+ssmforge arch A --compare B C D
+ssmforge arch --compare A B C D --format markdown
+```
+
+Renders a multi-model comparison table showing every field's value
+across all models. Fields that match across all models are listed in an
+"Identical across all models" section (not in the table) to keep the
+table scannable.
+
+Both JSON and Markdown output supported. JSON includes per-field
+`all_same` and `unique_values` so programmatic consumers can quickly
+filter for differences.
+
+Works with `--dry-run` for config-only comparisons (no weight download).
+Works with `--format markdown` for GitHub-friendly tables.
+
+**Back-compat:** legacy `--diff B` (one-vs-one) still works and produces
+the same output as `--compare A B`. New flag is purely additive.
+
+**Python API additions:**
+- `compare_reports(reports_list)` — N-way comparison
+- `format_compare_markdown(comparison)` — Markdown table renderer
+
+Tests: 91 passed (was 80). 11 new tests covering 2-model, 3-model,
+markdown output, JSON output, dry-run, source-positional-then-compare,
+back-compat with `--diff`, and fail-fast on bad paths.
+
+### v0.1.6 — 2026-09-22
 
 **New quirks detector coverage:**
 - StarCoder / StarCoder2 (`gpt_bigcode`, `starcoder`, `starcoder2` model types)
