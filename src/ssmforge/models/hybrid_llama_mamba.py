@@ -31,6 +31,12 @@ class HybridLlamaMambaConfig(LlamaConfig):
         ssm_expand: int = 2,
         **kwargs,
     ):
+        # Default attention_bias=True so the model supports architectures like
+        # Qwen2 that use bias=True on q/k/v projections. Llama itself defaults
+        # to bias=False, but Qwen2-1.5B (a common source) requires bias=True
+        # for correct output. If the user passes attention_bias explicitly,
+        # their value wins.
+        kwargs.setdefault("attention_bias", True)
         super().__init__(**kwargs)
         self.ssm_layer_indices = ssm_layer_indices or []
         self.ssm_expand = ssm_expand

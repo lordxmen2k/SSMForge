@@ -30,6 +30,9 @@ def _build_fake_llama_state_dict(hidden: int, n_layers: int, vocab: int, interme
     for i in range(n_layers):
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             sd[f"model.layers.{i}.self_attn.{proj}.weight"] = torch.randn(hidden, hidden)
+            # HybridLlamaMambaConfig defaults to attention_bias=True to support
+            # Qwen2-style models. Llama equivalent (bias=False) is bias=zeros.
+            sd[f"model.layers.{i}.self_attn.{proj}.bias"] = torch.zeros(hidden)
         inter = intermediate
         sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.randn(inter, hidden)

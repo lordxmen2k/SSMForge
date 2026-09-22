@@ -142,6 +142,9 @@ def _run_pipeline(
         max_position_embeddings=model.config.max_position_embeddings,
         rope_theta=getattr(model.config, "rope_theta", 10000.0),
         ssm_layer_indices=[spec.index for spec in plan if spec.layer_type.value == "ssm"],
+        # Qwen2 uses bias=True on attention q/k/v projections. Forward the
+        # source model's setting so we don't lose learned bias terms.
+        attention_bias=getattr(model.config, "attention_bias", True),
     )
 
     # Skip distillation entirely when there are no SSM layers to distill.

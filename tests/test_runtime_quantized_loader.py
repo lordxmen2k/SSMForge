@@ -33,6 +33,7 @@ def _build_minimal_state_dict(hidden=256, n_layers=4, inter=1024, vocab=100):
     for i in range(n_layers):
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             sd[f"model.layers.{i}.self_attn.{proj}.weight"] = torch.randn(hidden, hidden)
+            sd[f"model.layers.{i}.self_attn.{proj}.bias"] = torch.zeros(hidden)
         sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.randn(hidden, inter)

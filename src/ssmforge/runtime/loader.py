@@ -156,6 +156,9 @@ def load_hybrid_model_from_gguf(
         ssm_d_conv=ssm_d_conv,
         ssm_dt_rank=ssm_dt_rank,
         ssm_n_group=ssm_n_group,
+        # Qwen2 (and many Qwen-family models) use bias=True on q/k/v_proj.
+        # Llama defaults to bias=False, but our model needs to support both.
+        attention_bias=True,
     )
     model = HybridLlamaMambaModel(config)
 

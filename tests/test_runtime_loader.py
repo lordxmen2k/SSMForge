@@ -22,6 +22,8 @@ def _build_minimal_hybrid_state_dict(hidden: int = 256, n_layers: int = 4, inter
     for i in range(n_layers):
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             sd[f"model.layers.{i}.self_attn.{proj}.weight"] = torch.randn(hidden, hidden)
+            # attention_bias=True default in our config; Llama equivalent = zeros
+            sd[f"model.layers.{i}.self_attn.{proj}.bias"] = torch.zeros(hidden)
         sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.randn(inter, hidden)
         sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.randn(hidden, inter)
@@ -299,6 +301,60 @@ def test_loader_loads_q4k_quantized_tensor(tmp_path):
     embed_t = embed_data["model.embed_tokens.weight"]
     assert embed_t.shape == (vocab, hidden), \
         f"dequant shape {tuple(embed_t.shape)} should be (vocab, hidden) = ({vocab}, {hidden})"
+
+
+def test_loader_loads_qwen2_with_bias(tmp_path):
+    """Qwen2 has bias=True on q/k/v projections. The loader must accept this.
+
+    Bug found in pure-attention smoke test on Qwen2-1.5B: model was
+    producing gibberish output. Root cause: Qwen2 has
+    `model.layers.{i}.self_attn.{q,k,v}_proj.bias` tensors but the
+    HybridLlamaMambaConfig was defaulting to attention_bias=False
+    (Llama convention). Bias terms were silently dropped during
+    load_state_dict, breaking the attention computation.
+
+    Fix: HybridLlamaMambaConfig defaults attention_bias=True so the
+    q/k/v bias tensors are loaded correctly.
+
+    This test builds a Qwen2-shaped state dict with bias=True on
+    attention projections, writes it to F16 GGUF, loads it back, and
+    verifies:
+      - All bias tensors are present and loaded
+      - No "missing keys" warning for bias tensors
+    """
+    hidden, n_layers, inter, vocab, n_heads, n_kv_heads = 64, 2, 128, 100, 4, 2
+    head_dim = hidden // n_heads
+    kv_dim = head_dim * n_kv_heads
+
+    sd = _build_minimal_hybrid_state_dict(hidden, n_layers, inter, vocab)
+    # Override K/V weights and biases to match Qwen2's grouped attention
+    for i in range(n_layers):
+        sd[f"model.layers.{i}.self_attn.k_proj.weight"] = torch.randn(kv_dim, hidden) * 0.05
+        sd[f"model.layers.{i}.self_attn.v_proj.weight"] = torch.randn(kv_dim, hidden) * 0.05
+        sd[f"model.layers.{i}.self_attn.q_proj.bias"] = torch.randn(hidden) * 0.05
+        sd[f"model.layers.{i}.self_attn.k_proj.bias"] = torch.randn(kv_dim) * 0.05
+        sd[f"model.layers.{i}.self_attn.v_proj.bias"] = torch.randn(kv_dim) * 0.05
+        sd[f"model.layers.{i}.self_attn.o_proj.bias"] = torch.zeros(hidden)  # Llama also zeros this
+
+    cfg = _build_minimal_config(hidden, n_layers, inter, vocab, n_heads)
+    # Update config to match Qwen2's grouped attention
+    cfg.num_key_value_heads = n_kv_heads
+
+    f16_path = tmp_path / "qwen2_bias.f16.gguf"
+    write_f16_gguf(sd, cfg, tokenizer=None, output_path=f16_path)
+
+    # Load the GGUF; the bias terms must NOT be in missing_keys
+    import warnings as warnings_mod
+    with warnings_mod.catch_warnings(record=True) as w:
+        warnings_mod.simplefilter("always")
+        model, _ = load_hybrid_model_from_gguf(f16_path)
+
+    # Better check: compare loaded bias to source bias
+    for i in range(n_layers):
+        src_q_bias = sd[f"model.layers.{i}.self_attn.q_proj.bias"]
+        loaded_q_bias = model.model.layers[i].self_attn.q_proj.bias
+        assert torch.equal(src_q_bias, loaded_q_bias), \
+            f"Layer {i} q_proj.bias not loaded correctly"
 
 
 def test_loader_loads_pure_attention_gguf_no_ssm(tmp_path):
