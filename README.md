@@ -964,6 +964,52 @@ The install put the script in a directory not on your PATH. Activate
 your venv (see [4.2](#42-create-a-virtual-environment-recommended)) or
 check `pip show ssmforge` for the install location.
 
+**`ssmforge: command not found` after `pip install` succeeds (Windows)**
+
+When `pip install ssmforge` writes to a per-user location instead of
+your venv (often on Windows when system Python isn't writable), the
+`ssmforge.exe` script ends up at:
+
+```
+%APPDATA%\Python\Python314\Scripts\ssmforge.exe
+```
+
+…but that folder isn't on your PATH by default. Three fixes:
+
+```powershell
+# PowerShell (persistent, restart shell after)
+$env:APPDATA = $env:APPDATA
+[Environment]::SetEnvironmentVariable("PATH",
+    "$env:APPDATA\Python\Python314\Scripts;" +
+    [Environment]::GetEnvironmentVariable("PATH", "User"),
+    "User")
+```
+
+```bash
+# Git Bash (persistent)
+echo 'export PATH="$APPDATA/Python/Python314/Scripts:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Or just use `python -m ssmforge.cli <subcommand>` as a workaround:
+
+```bash
+python -m ssmforge.cli --version
+python -m ssmforge.cli doctor
+python -m ssmforge.cli arch Qwen/Qwen2-0.5B-Instruct --dry-run
+```
+
+**Recommendation: install in a venv** so the Scripts folder is
+predictably inside your project's `.venv/`:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate    # Linux / Mac / Git Bash
+.venv\Scripts\activate       # Windows PowerShell
+pip install ssmforge
+ssmforge --version           # works
+```
+
 ### Loading the model
 
 **`401 Unauthorized` for a gated model**
