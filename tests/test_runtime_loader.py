@@ -299,3 +299,37 @@ def test_loader_loads_q4k_quantized_tensor(tmp_path):
     embed_t = embed_data["model.embed_tokens.weight"]
     assert embed_t.shape == (vocab, hidden), \
         f"dequant shape {tuple(embed_t.shape)} should be (vocab, hidden) = ({vocab}, {hidden})"
+
+
+def test_loader_loads_pure_attention_gguf_no_ssm(tmp_path):
+    """Pure-attention recipe produces a GGUF with zero SSM tensors.
+
+    The loader must handle this gracefully — no mamba.* tensors means
+    ssm_layer_indices=[] and the model is architecturally just a Llama
+    with attention-only layers. This is the baseline test verifying the
+    conversion pipeline is non-destructive.
+    """
+    hidden, n_layers, inter, vocab, n_heads = 64, 4, 128, 100, 4
+    sd = _build_minimal_hybrid_state_dict(hidden, n_layers, inter, vocab)
+    # Critical: NO mamba.* tensors — this is the pure-attention case.
+    cfg = _build_minimal_config(hidden, n_layers, inter, vocab, n_heads)
+    f16_path = tmp_path / "pure_attention.f16.gguf"
+    write_f16_gguf(sd, cfg, tokenizer=None, output_path=f16_path)
+
+    # Verify the GGUF contains no mamba.* tensors
+    reader = GGUFReader(str(f16_path), mode="r")
+    mamba_tensors = [t.name for t in reader.tensors if ".mamba." in t.name]
+    assert len(mamba_tensors) == 0, \
+        f"pure-attention GGUF should have no mamba tensors, found: {mamba_tensors}"
+
+    # Load and verify ssm_layer_indices is empty
+    model, metadata = load_hybrid_model_from_gguf(f16_path)
+    assert model.config.ssm_layer_indices == [], \
+        f"pure-attention model should have no SSM layers, got {model.config.ssm_layer_indices}"
+    assert metadata["general.architecture"] == "ssmforge"
+
+    # Forward pass should work end-to-end with all-attention layers
+    input_ids = torch.randint(0, vocab, (1, 8))
+    out = model(input_ids=input_ids)
+    assert out.logits.shape == (1, 8, vocab)
+    assert torch.isfinite(out.logits).all()

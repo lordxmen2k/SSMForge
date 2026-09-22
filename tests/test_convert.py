@@ -63,3 +63,22 @@ def test_convert_unsupported_arch_raises(tmp_path):
         with pytest.raises(Exception) as exc:
             convert(source="fake", recipe="hybrid-25", output_dir=tmp_path, dry_run=True)
     assert "not supported" in str(exc.value).lower() or "UnsupportedArchitecture" in str(exc.value)
+
+
+def test_convert_pure_attention_dry_run(tmp_path):
+    """Pure-attention recipe dry-runs without errors and reports 0 SSM layers."""
+    with patch("ssmforge.pipeline._load_model", return_value=(_fake_llama_model(), _fake_sd())):
+        result = convert(
+            source="fake/model",
+            recipe="pure-attention",
+            quantize="F16",
+            output_dir=tmp_path,
+            dry_run=True,
+        )
+    assert result.stats["layer_count"] == 16
+    assert result.stats["ssm_count"] == 0
+    assert result.stats["attention_count"] == 16
+    assert result.stats["recipe"] == "pure-attention"
+    # Every layer should be attention
+    for spec in result.stats["layer_mapping"]:
+        assert spec["layer_type"] == "attention"

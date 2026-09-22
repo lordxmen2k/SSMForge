@@ -187,10 +187,17 @@ SSMForge-specific numbers. Run the benchmark snippet above to get them.
 
 | Recipe | Quality vs teacher |
 |--------|--------------------|
+| pure-attention | TBD (baseline — round-trips source model through our pipeline unchanged) |
 | dense Q4_K_M (baseline) | TBD (typically ~98% for dense models with llama.cpp's quant) |
 | hybrid-25 | TBD (paper claims ~95-98%, our impl unverified) |
 | hybrid-50 | TBD (paper claims ~90-95%, our impl unverified) |
 | pure-mamba | TBD (paper claims ~60-80%, our impl unverified) |
+
+`pure-attention` is a **diagnostic recipe** that copies all attention layers
+verbatim with no SSM substitution. Use it to verify the conversion pipeline
+(F16 GGUF write → llama-quantize → self-contained loader → forward pass)
+doesn't degrade the source model. If pure-attention produces coherent output
+and hybrid-25 doesn't, the gap is in distillation quality, not conversion.
 
 Run `ssmforge convert ... --verify` and benchmark on lm-evaluation-harness to
 get real numbers for your model.
@@ -395,7 +402,7 @@ from ssmforge import convert
 
 result = convert(
     source="meta-llama/Llama-3.1-8B-Instruct",
-    recipe="hybrid-25",                          # hybrid-25 | hybrid-50 | pure-mamba
+    recipe="hybrid-25",                          # pure-attention | hybrid-25 | hybrid-50 | pure-mamba
     quantize="Q4_K_M",                           # F16 | Q8_0 | Q5_K_M | Q4_K_M | Q4_K_S
     output_dir=Path("./out"),
     calibration_data=None,                       # None = built-in default; or path/dataset id

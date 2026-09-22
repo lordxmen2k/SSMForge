@@ -15,6 +15,7 @@ from ssmforge.recipes.base import (
 from ssmforge.recipes import hybrid_25  # noqa: F401, E402
 from ssmforge.recipes import hybrid_50  # noqa: F401, E402
 from ssmforge.recipes import pure_mamba  # noqa: F401, E402
+from ssmforge.recipes import pure_attention  # noqa: F401, E402
 
 __all__ = [
     "Recipe",

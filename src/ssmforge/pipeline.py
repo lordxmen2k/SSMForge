@@ -144,7 +144,21 @@ def _run_pipeline(
         ssm_layer_indices=[spec.index for spec in plan if spec.layer_type.value == "ssm"],
     )
 
-    if tokenizer is not None and not no_distill:
+    # Skip distillation entirely when there are no SSM layers to distill.
+    # This applies to recipes like pure-attention where the converter passes
+    # all attention layers through unchanged. Distillation would be wasted
+    # compute and could even degrade the model.
+    if ssm_count == 0:
+        stats["training_stats"] = {"skipped": True, "reason": "no SSM layers (pure-attention recipe)"}
+        # For pure-attention we bypass the student model entirely. Building a
+        # HybridLlamaMambaModel with empty ssm_layer_indices produces a Llama-
+        # shaped model, but the source might be Qwen2 / Mistral / etc. whose
+        # weights won't load cleanly into Llama layers. Instead, we use the
+        # converter's output (target_sd) directly — it already has the source
+        # weights copied verbatim for all attention layers.
+        # Set student = None so Stage 5 falls back to target_sd.
+        student = None
+    elif tokenizer is not None and not no_distill:
         student = HybridLlamaMambaModel(config)
         student.load_state_dict(target_sd, strict=False)
 
