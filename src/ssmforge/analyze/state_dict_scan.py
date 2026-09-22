@@ -69,21 +69,46 @@ class QuirkReport:
         return asdict(self)
 
 
-def _layer_zero_keys(state_dict: dict, layer_prefix: str = "model.layers.0.") -> list[str]:
+def _infer_layer_prefix(state_dict: dict) -> str | None:
+    """Auto-detect the per-layer key prefix used by this model.
+
+    Supports:
+    - 'model.layers.{N}.' (Llama, Qwen2, Mistral, Phi-3, Gemma2, Mixtral, ...)
+    - 'transformer.h.{N}.' (Falcon, GPT-NeoX)
+    - 'gpt_neox.layers.{N}.' (Pythia)
+    Returns the prefix for layer 0, e.g. 'model.layers.0.'.
+    """
+    candidates = ("model.layers.0.", "transformer.h.0.", "gpt_neox.layers.0.")
+    for cand in candidates:
+        if any(k.startswith(cand) for k in state_dict):
+            return cand
+    return None
+
+
+def _layer_zero_keys(state_dict: dict, layer_prefix: str | None = None) -> list[str]:
     """Get keys for layer 0 only (a single representative layer)."""
+    if layer_prefix is None:
+        layer_prefix = _infer_layer_prefix(state_dict)
+    if layer_prefix is None:
+        return []
     return [k for k in state_dict if k.startswith(layer_prefix)]
 
 
 def _infer_num_layers(state_dict: dict) -> int:
-    """Infer the number of layers from state dict keys."""
+    """Infer the number of layers from state dict keys.
+
+    Supports 'model.layers.{N}', 'transformer.h.{N}', 'gpt_neox.layers.{N}'.
+    """
+    prefixes = ("model.layers.", "transformer.h.", "gpt_neox.layers.")
     layer_indices = set()
-    for k in state_dict:
-        if k.startswith("model.layers."):
-            rest = k[len("model.layers."):]
-            if "." in rest:
-                idx = rest.split(".", 1)[0]
-                if idx.isdigit():
-                    layer_indices.add(int(idx))
+    for prefix in prefixes:
+        for k in state_dict:
+            if k.startswith(prefix):
+                rest = k[len(prefix):]
+                if "." in rest:
+                    idx = rest.split(".", 1)[0]
+                    if idx.isdigit():
+                        layer_indices.add(int(idx))
     return max(layer_indices) + 1 if layer_indices else 0
 
 
@@ -185,7 +210,8 @@ def scan_state_dict(state_dict: dict, config: Any = None, num_layers: int | None
         return report
 
     # ===== State-dict-based quirks =====
-    layer0_keys = _layer_zero_keys(state_dict)
+    layer_prefix = _infer_layer_prefix(state_dict)
+    layer0_keys = _layer_zero_keys(state_dict, layer_prefix)
 
     # ---- Attention bias ----
     bias_keys = [
@@ -222,6 +248,18 @@ def scan_state_dict(state_dict: dict, config: Any = None, num_layers: int | None
             q_weight_key = k
         elif k.endswith("self_attn.k_proj.weight"):
             k_weight_key = k
+        elif k.endswith("self_attn.qkv_proj.weight"):
+            # Phi-3-style: qkv_proj holds [q;k;v] concatenated
+            # Output dim = q_dim + k_dim + v_dim; with GQA, k_dim == v_dim < q_dim
+            # We treat the fused projection's output dim vs the q-only contribution
+            # as if all rows were q-sized (worst case for Q).
+            q_weight_key = k  # we'll divide by 3 in the heuristic
+        elif k.endswith("self_attention.query_key_value.weight"):
+            # Falcon style: fused QKV
+            q_weight_key = k
+        elif k.endswith("attention.query_key_value.weight"):
+            # GPT-NeoX / Pythia style: fused QKV
+            q_weight_key = k
 
     if q_weight_key and k_weight_key:
         q_shape = state_dict[q_weight_key].shape
@@ -245,6 +283,20 @@ def scan_state_dict(state_dict: dict, config: Any = None, num_layers: int | None
                     if q_out > 0 and k_out > 0 and (q_out / k_out) >= 8:
                         report.mqa = True
 
+    # When the Q/K/V tensors are fused into a single projection
+    # (Phi-3 qkv_proj, Falcon/GPT-NeoX query_key_value), we can't compare
+    # q vs k shapes directly. Use the config instead.
+    if (q_weight_key and (
+            q_weight_key.endswith("qkv_proj.weight") or
+            q_weight_key.endswith("query_key_value.weight")
+        ) and config is not None):
+        n_heads = getattr(config, "num_attention_heads", 1)
+        n_kv_heads = getattr(config, "num_key_value_heads", n_heads)
+        if n_heads > 1 and n_kv_heads < n_heads:
+            report.grouped_attention = True
+        if n_heads > 1 and n_kv_heads == 1:
+            report.mqa = True
+
     # ---- MoE ----
     moe_keys = [
         k for k in state_dict
@@ -255,27 +307,33 @@ def scan_state_dict(state_dict: dict, config: Any = None, num_layers: int | None
         report.moe_keys_found = sorted(set(moe_keys))[:5]
 
     # ---- Tied embeddings ----
-    embed_key = None
-    head_key = None
-    for k in state_dict:
-        if k == "model.embed_tokens.weight":
-            embed_key = k
-        elif k == "lm_head.weight":
-            head_key = k
-
-    if embed_key is not None and head_key is None:
-        report.tied_embeddings = True
-    elif embed_key is not None and head_key is not None:
-        e = state_dict[embed_key]
-        h = state_dict[head_key]
-        if hasattr(e, "data_ptr") and hasattr(h, "data_ptr"):
-            if e.data_ptr() == h.data_ptr():
-                report.tied_embeddings = True
-        elif hasattr(e, "ctypes") and hasattr(h, "ctypes"):
-            if e.ctypes.data == h.ctypes.data:
-                report.tied_embeddings = True
-        elif id(e) == id(h):
+    # Check several common embed/head key pairs:
+    #   - 'model.embed_tokens.weight' / 'lm_head.weight' (Llama, Qwen2, Mistral, ...)
+    #   - 'gpt_neox.embed_in.weight' / 'gpt_neox.embed_out.weight' (GPT-NeoX, Pythia)
+    #   - 'transformer.word_embeddings.weight' / 'lm_head.weight' (Falcon)
+    embed_head_pairs = (
+        ("model.embed_tokens.weight", "lm_head.weight"),
+        ("gpt_neox.embed_in.weight", "gpt_neox.embed_out.weight"),
+        ("transformer.word_embeddings.weight", "lm_head.weight"),
+        ("transformer.wte.weight", "lm_head.weight"),
+    )
+    for embed_key, head_key in embed_head_pairs:
+        if embed_key in state_dict and head_key not in state_dict:
+            # No head at all — embeddings serve as the head
             report.tied_embeddings = True
+            break
+        if embed_key in state_dict and head_key in state_dict:
+            e = state_dict[embed_key]
+            h = state_dict[head_key]
+            if hasattr(e, "data_ptr") and hasattr(h, "data_ptr"):
+                if e.data_ptr() == h.data_ptr():
+                    report.tied_embeddings = True
+            elif hasattr(e, "ctypes") and hasattr(h, "ctypes"):
+                if e.ctypes.data == h.ctypes.data:
+                    report.tied_embeddings = True
+            elif id(e) == id(h):
+                report.tied_embeddings = True
+            break
 
     # ---- MLP type ----
     report.mlp_type = _detect_mlp_type(layer0_keys)
