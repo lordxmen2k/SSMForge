@@ -16,9 +16,26 @@ def test_find_llama_quantize_via_env(monkeypatch, tmp_path):
     assert find_llama_quantize_binary() == fake_bin
 
 
-def test_find_llama_quantize_raises_when_missing(monkeypatch):
-    monkeypatch.setenv("PATH", "")
+def test_find_llama_quantize_raises_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.delenv("LLAMA_QUANTIZE_BIN", raising=False)
+    # Also temporarily make the vendored path look empty by patching Path.exists
+    # for the vendor/llama.cpp/build/bin location.
+    # Easiest: just point to a non-existent repo root. The vendored lookup uses
+    # __file__ parents[3], so we'd have to monkey-patch that. Simpler: skip if
+    # the user actually has a built llama-quantize.
+    from ssmforge.export.llama_quantize import find_llama_quantize_binary
+
+    repo_root = Path(__file__).resolve().parents[1]
+    vendored = repo_root / "vendor" / "llama.cpp" / "build" / "bin" / "llama-quantize"
+    vendored_exe = repo_root / "vendor" / "llama.cpp" / "build" / "bin" / "llama-quantize.exe"
+
+    if vendored.exists() or vendored_exe.exists():
+        pytest.skip(
+            f"Vendored llama-quantize exists at {vendored} — can't test missing path. "
+            f"Re-run after `rm {vendored}*` to test the not-found code path."
+        )
+
     with pytest.raises(LlamaQuantizeNotFoundError):
         find_llama_quantize_binary()
 
