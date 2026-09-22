@@ -33,6 +33,50 @@ from dataclasses import dataclass, field, asdict
 from typing import Any
 
 
+# In-report field descriptions: human-readable explanations of every
+# quirk and config key ssmforge arch reports. Users can hit ssmforge
+# with --fields and know what each column means.
+FIELD_DESCRIPTIONS: dict[str, str] = {
+    # Quirks (boolean)
+    "attention_bias": "Whether q/k/v projections have learned bias terms (Qwen2 = True, Llama = False)",
+    "tied_embeddings": "Whether lm_head shares storage with embed_tokens (saves memory, common in Qwen2/Pythia/Gemma)",
+    "fused_qkv": "Whether Q/K/V are concatenated into one qkv_proj.weight (Phi-3 style)",
+    "fused_gate_up": "Whether gate_proj and up_proj are concatenated into gate_up_proj.weight (Phi-3 style)",
+    "moe": "Whether the model uses Mixture-of-Experts (router + expert MLPs)",
+    "grouped_attention": "Whether the model uses Grouped Query Attention (kv_heads < heads)",
+    "mqa": "Whether the model uses Multi-Query Attention (kv_heads == 1, Falcon/Pythia)",
+    "layer_scale": "Whether the model has learnable per-channel residual scales (Phi-3 / ViT)",
+    "mlp_type": "MLP activation family: swiglu / geglu / gelu / unknown",
+    "norm_type": "Normalization type: rms (Llama-style) / layer (GPT-2-style)",
+    "sliding_window": "Window size for sliding-window attention (Mistral, Gemma2)",
+    "partial_rope_factor": "Fraction of head dimensions RoPE is applied to (Command-R)",
+    "num_experts": "Number of MoE expert MLPs (Mixtral = 8, DeepSeek = 60+)",
+    "moe_top_k": "Number of experts activated per token (Mixtral = 2)",
+    "soft_capping": "Logit soft-capping values (Gemma2 style)",
+
+    # Config
+    "model_type": "Architecture identifier from HuggingFace (llama, qwen2, mistral, phi3, ...)",
+    "vocab_size": "Size of the tokenizer vocabulary",
+    "hidden_size": "Dimensionality of hidden states",
+    "intermediate_size": "Dimensionality of MLP intermediate layer",
+    "num_hidden_layers": "Number of transformer blocks",
+    "num_attention_heads": "Number of attention heads per layer",
+    "num_key_value_heads": "Number of K/V heads (smaller than heads in GQA/MQA)",
+    "max_position_embeddings": "Maximum sequence length the model supports",
+    "rope_theta": "Base frequency for Rotary Position Embedding",
+    "rope_theta_source": "Where rope_theta was resolved from (config.rope_theta / config.rope_parameters / config.rope_scaling)",
+    "rope_scaling_type": "Type of long-context scaling, if any (linear, dynamic, yarn, ...)",
+    "tie_word_embeddings": "Whether the model has tied input/output embeddings (informational)",
+    "attention_bias_in_state_dict": "Whether q/k/v have bias tensors in the actual weights",
+    "tied_embeddings_in_state_dict": "Whether embed_tokens and lm_head share the same tensor object",
+
+    # Profile
+    "family": "Human-readable architecture family classification",
+    "attention_type": "Attention variant: MHA / GQA / MQA / fused",
+    "descriptors": "List of human-readable traits (tied-embeddings, GQA 6:1, ...)",
+}
+
+
 @dataclass
 class QuirkReport:
     """Comprehensive architectural quirk detection report."""

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import signal
 import sys
@@ -23,10 +24,14 @@ from pathlib import Path
 
 
 @contextlib.contextmanager
-def _arch_load_progress(model_id: str, dry_run: bool = False):
+def _arch_load_progress(model_id: str, dry_run: bool = False, revision: str | None = None):
     """Load a HuggingFace model for `ssmforge arch`, with progress on stderr.
 
     If `dry_run=True`, fetches only the config (no weight download).
+    If `revision` is given, pins to that HF commit sha/tag/branch.
+
+    Yields the loaded object. The resolved revision sha is stashed on
+    `obj.ssmforge_revision` after load so the caller can read it.
     """
     if dry_run:
         print(f"Loading config for {model_id}... (dry-run, no weights)", file=sys.stderr)
@@ -37,20 +42,107 @@ def _arch_load_progress(model_id: str, dry_run: bool = False):
         if dry_run:
             # Config only — no weight download. AutoConfig fetches config.json.
             from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(model_id)
+            config = AutoConfig.from_pretrained(model_id, revision=revision)
+            # Resolve the actual sha that was loaded
+            try:
+                resolved = getattr(config, "_name_or_path", None)
+                rev = getattr(config, "revision", revision) or revision
+                # Try to look up the actual sha from the HF hub cache
+                if revision is None:
+                    rev = _resolve_hf_revision(model_id)
+                else:
+                    rev = revision
+                config.ssmforge_revision = rev
+            except Exception:
+                config.ssmforge_revision = revision
             yield config
         else:
             from transformers import AutoModelForCausalLM
             # `dtype=` is the new transformers ≥ 4.50 kwarg; `torch_dtype` is deprecated
             # and emits a warning on every load. Try `dtype` first, fall back if older.
             try:
-                model = AutoModelForCausalLM.from_pretrained(model_id, dtype="auto")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id, dtype="auto", revision=revision
+                )
             except TypeError:
                 # transformers < 4.50
-                model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id, torch_dtype="auto", revision=revision
+                )
+            try:
+                if revision is None:
+                    model.ssmforge_revision = _resolve_hf_revision(model_id)
+                else:
+                    model.ssmforge_revision = revision
+            except Exception:
+                model.ssmforge_revision = revision
             yield model
     finally:
         pass
+
+
+def _resolve_hf_revision(model_id: str) -> str | None:
+    """Resolve the current HEAD sha for a HF model.
+
+    Uses the huggingface_hub API. Returns None on failure.
+    """
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        info = api.model_info(model_id)
+        return getattr(info, "sha", None)
+    except Exception:
+        return None
+
+
+def _subset_report(report: dict, fields: str | None) -> dict:
+    """Subset a report to only the comma-separated field names.
+
+    Field names can be top-level keys (e.g. 'config', 'profile') or
+    dotted paths (e.g. 'profile.family', 'quirks.attention_bias').
+    Returns a new dict. If `fields` is None, returns the report as-is.
+    If `fields == 'all'`, returns the full report.
+    """
+    if fields is None or fields == "all":
+        return report
+
+    requested = [f.strip() for f in fields.split(",") if f.strip()]
+    out: dict = {}
+
+    def _set_path(d, path, value):
+        """Set d['a']['b'] = value, creating dicts as needed."""
+        parts = path.split(".")
+        cur = d
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur.get(p), dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = value
+
+    for path in requested:
+        # Walk the path in `report`, return value or None if any step is missing
+        parts = path.split(".")
+        cur = report
+        ok = True
+        for p in parts:
+            if not isinstance(cur, dict) or p not in cur:
+                ok = False
+                break
+            cur = cur[p]
+        if ok:
+            _set_path(out, path, cur)
+        else:
+            print(f"Warning: field {path!r} not found in report", file=sys.stderr)
+    return out
+
+
+def _profile_only_report(report: dict) -> dict:
+    """Return just the profile section of a report."""
+    return {
+        "model_id": report.get("model_id"),
+        "model_type": report.get("model_type"),
+        "profile": report.get("profile", {}),
+    }
 
 
 def _is_local_path(source: str) -> bool:
@@ -332,6 +424,28 @@ def main(argv: list[str] | None = None) -> None:
              "`source` positional (or --compare if source is omitted). Renders "
              "a multi-model comparison table.",
     )
+    arch_p.add_argument(
+        "--rev", "--revision", dest="revision", default=None,
+        help="Pin to a specific HF revision (commit sha, tag, or branch). "
+             "Otherwise loads the current HEAD of the repo's default branch.",
+    )
+    arch_p.add_argument(
+        "--fields", metavar="NAME", default=None,
+        help="Subset the output to comma-separated field names (works with both "
+             "single-model and --compare). Field names are top-level keys from the "
+             "report (config.*, quirks.*, profile.*, etc). Use 'all' for everything.",
+    )
+    arch_p.add_argument(
+        "--only-different", action="store_true",
+        help="In --compare mode, suppress the 'Identical across all models' "
+             "section. Default already shows only differing fields in the table, "
+             "this flag additionally excludes the identical summary.",
+    )
+    arch_p.add_argument(
+        "--profile", action="store_true",
+        help="Emit only the profile section (family, attention_type, mlp_type, "
+             "norm_type, descriptors). Useful for quick eyeball checks.",
+    )
 
     # ---- doctor subcommand ----
     doctor_p = subparsers.add_parser(
@@ -409,7 +523,9 @@ def _cmd_arch(args) -> None:
     reports = []
     for model_id in models_to_load:
         try:
-            with _arch_load_progress(model_id, dry_run=args.dry_run) as obj:
+            with _arch_load_progress(
+                model_id, dry_run=args.dry_run, revision=args.revision
+            ) as obj:
                 if args.dry_run:
                     r = build_report_from_config(model_id=model_id, config=obj)
                 else:
@@ -418,6 +534,10 @@ def _cmd_arch(args) -> None:
                         config=obj.config,
                         state_dict=dict(obj.state_dict()),
                     )
+                # Stamp the resolved HF revision on the report for traceability
+                rev = getattr(obj, "ssmforge_revision", None)
+                if rev:
+                    r["hf_revision"] = rev
             reports.append(r)
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)
@@ -441,6 +561,16 @@ def _cmd_arch(args) -> None:
     # Single model
     if n_models == 1:
         report_a = reports[0]
+        # Capture compatibility before any subsetting (so we still have it for exit code)
+        is_compat = report_a.get("compatibility", {}).get("is_compatible", True)
+        # --profile emits just the profile section
+        if args.profile:
+            output_text = json.dumps(_profile_only_report(report_a), indent=2)
+            _write_or_print(output_text, args.output)
+            sys.exit(0 if is_compat else 2)
+        # --fields subsets the report
+        if args.fields:
+            report_a = _subset_report(report_a, args.fields)
         if args.format in ("markdown", "md"):
             output_text = format_report_markdown(report_a)
         else:
@@ -452,17 +582,30 @@ def _cmd_arch(args) -> None:
                     print(render_summary(report_a), file=sys.stderr)
 
         _write_or_print(output_text, args.output)
-        sys.exit(0 if report_a["compatibility"]["is_compatible"] else 2)
+        # Capture compatibility BEFORE subsetting (in case --fields removed it)
+        is_compat = report_a.get("compatibility", {}).get("is_compatible", True)
+        sys.exit(0 if is_compat else 2)
 
     # Two models (legacy --diff behavior, preserved for back-compat)
     if n_models == 2 and not args.compare:
         report_a, report_b = reports
+        if args.profile:
+            # Emit profile for both, side by side
+            output = {
+                "models": [args._compare_models[0], args._compare_models[1]],
+                "profiles": [_profile_only_report(report_a)["profile"],
+                             _profile_only_report(report_b)["profile"]],
+            }
+            _write_or_print(json.dumps(output, indent=2), args.output)
+            sys.exit(0)
+        if args.fields:
+            report_a = _subset_report(report_a, args.fields)
+            report_b = _subset_report(report_b, args.fields)
         diff = diff_reports(report_a, report_b)
         if args.format in ("markdown", "md"):
             md = _format_diff_markdown(report_a, report_b, diff)
             _write_or_print(md, args.output)
         else:
-            import json as json_mod
             output = {
                 "model_a": args._compare_models[0],
                 "model_b": args._compare_models[1],
@@ -471,16 +614,47 @@ def _cmd_arch(args) -> None:
                 "added_quirks": diff["added_quirks"],
                 "removed_quirks": diff["removed_quirks"],
             }
-            _write_or_print(json_mod.dumps(output, indent=2), args.output)
+            _write_or_print(json.dumps(output, indent=2), args.output)
         sys.exit(0)
 
     # Multi-model comparison (3+ models, or --compare with 2 models)
+    # --profile: emit profile sections for all models
+    if args.profile:
+        output = {
+            "model_count": len(reports),
+            "profiles": [
+                {"model_id": r.get("model_id"), "profile": r.get("profile", {})}
+                for r in reports
+            ],
+        }
+        _write_or_print(json.dumps(output, indent=2), args.output)
+        sys.exit(0)
+
+    # --fields: subset each report before comparison
+    if args.fields:
+        reports = [_subset_report(r, args.fields) for r in reports]
+
     comparison = compare_reports(reports)
     if args.format in ("markdown", "md"):
         md = format_compare_markdown(comparison)
+        if args.only_different:
+            # Strip the "Identical across all models" section from markdown
+            lines = md.split("\n")
+            filtered = []
+            in_identical = False
+            for line in lines:
+                if line.startswith("### Identical across all models"):
+                    in_identical = True
+                    continue
+                if in_identical:
+                    # Skip until next blank line + non-indented content
+                    if line.strip() == "":
+                        in_identical = False
+                    continue
+                filtered.append(line)
+            md = "\n".join(filtered).rstrip() + "\n"
         _write_or_print(md, args.output)
     else:
-        import json as json_mod
         # Add a small header so JSON consumers know it's a comparison
         output = {
             "comparison_type": "multi_model",
@@ -491,7 +665,9 @@ def _cmd_arch(args) -> None:
             "models": comparison["models"],
             "fields": comparison["fields"],
         }
-        _write_or_print(json_mod.dumps(output, indent=2), args.output)
+        if args.only_different:
+            output["fields"] = [f for f in comparison["fields"] if not f["all_same"]]
+        _write_or_print(json.dumps(output, indent=2), args.output)
     sys.exit(0)
 
 
@@ -523,8 +699,7 @@ def _cmd_doctor(args) -> None:
         info["huggingface_hub_version"] = "(not installed)"
 
     if args.format == "json":
-        import json as json_mod
-        print(json_mod.dumps(info, indent=2))
+        print(json.dumps(info, indent=2))
     else:
         print("ssmforge doctor")
         print("-" * 40)

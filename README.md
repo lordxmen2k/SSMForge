@@ -59,6 +59,22 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.1.8
+
+| Feature | Why it matters |
+|---------|----------------|
+| `--fields name1,name2` | Subset the report output to specific fields (works for single + compare) |
+| `--profile` | Emit just the profile section (family, attention_type, mlp_type, norm_type, descriptors) |
+| `--only-different` | In `--compare` mode, hide the "Identical across all models" section |
+| `--rev` / `--revision` | Pin to a specific HF commit/tag/branch for reproducibility |
+| HF revision tracked in reports | Every report now has `hf_revision` field with the resolved sha |
+| `FIELD_DESCRIPTIONS` dict | Programmatic access to inline docs for every quirk field |
+| `--fields` supports dotted paths | `quirks.attention_bias`, `profile.family` etc. |
+| `--compare --profile` | Compare only the profile sections of N models |
+| `--compare --only-different` JSON | Output JSON only contains differing fields |
+
+Plus 16 new tests (107 total).
+
 ### What's new in 0.1.7
 
 | Feature | Why it matters |
@@ -374,6 +390,10 @@ ssmforge arch <model_id_or_path> [options]
 | `--diff OTHER_MODEL` | | Compare against one other model (legacy, use `--compare` for 3+) | none |
 | `--compare MODEL [MODEL ...]` | | Compare 2+ models side-by-side. First model can come from positional. | none |
 | `--dry-run` | | Fetch only the config (no weight download); reports config-only quirks + memory estimate | full load |
+| `--rev` / `--revision` | | Pin to a specific HF commit sha/tag/branch (default: current HEAD) | HEAD |
+| `--fields name1,name2` | | Subset output to comma-separated field names. Dotted paths supported (e.g. `quirks.attention_bias`) | all |
+| `--profile` | | Emit only the profile section (family, attention_type, mlp_type, norm_type, descriptors) | full report |
+| `--only-different` | | In `--compare` mode, hide the "Identical across all models" section | show identical |
 
 **Examples:**
 
@@ -1098,7 +1118,42 @@ install.
 
 ## 16. Update log
 
-### v0.1.7 (current) — 2026-09-22
+### v0.1.8 (current) — 2026-09-22
+
+**New flags:**
+
+- `--fields name1,name2` — Subset the report output. Top-level keys
+  (`config`, `quirks`, `profile`, `state_dict_summary`, etc.) or dotted
+  paths (`quirks.attention_bias`, `profile.family`). Invalid field
+  names print a warning but don't crash.
+- `--profile` — Emit just the profile section (`family`,
+  `attention_type`, `mlp_type`, `norm_type`, `descriptors`). Useful
+  for quick eyeball checks or shell pipelines that only care about
+  the family.
+- `--only-different` — In `--compare` mode, hide the "Identical
+  across all models" section. Default already shows only differing
+  fields in the table; this flag additionally excludes the identical
+  summary.
+- `--rev` / `--revision` — Pin to a specific HF commit sha, tag, or
+  branch for reproducible reports. Default loads the current HEAD.
+
+**HF revision tracking:**
+
+Every report now has an `hf_revision` field with the resolved commit sha
+when available. Combined with `--rev`, this gives full reproducibility
+for arch reports.
+
+**New Python API:**
+
+- `FIELD_DESCRIPTIONS` dict in `ssmforge.analyze.state_dict_scan` —
+  inline docs for every quirk and config key. Useful for tooltips,
+  docs generation, or programmatic field validation.
+
+Tests: 107 passed (was 91). 16 new tests covering field subsetting,
+profile-only output, revision tracking, --only-different filtering,
+and FIELD_DESCRIPTIONS coverage.
+
+### v0.1.7 — 2026-09-22
 
 **New feature: N-way model comparison via `--compare`**
 
