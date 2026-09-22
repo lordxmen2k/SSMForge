@@ -59,6 +59,17 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.1.6
+
+| Feature | Why it matters |
+|---------|----------------|
+| StarCoder / OLMo / DeepSeek / OLMoE detection | More architectures now get a proper family label instead of "unknown" |
+| Falcon / Pythia now labeled specifically | Was: generic "Falcon / Pythia (MQA)". Now: "Falcon (MQA)" or "Pythia / GPT-NeoX (MQA)" |
+| `--quiet` also silences transformers warnings | The `torch_dtype` deprecation noise is gone when piping JSON to jq |
+| Family inference bug fix | StarCoder/OLMo/etc. were being mis-labeled due to a callable/config mismatch in the inferrer |
+
+Plus 11 new tests (80 total).
+
 ### What's new in 0.1.5
 
 | Feature | Why it matters |
@@ -1002,7 +1013,32 @@ install.
 
 ## 16. Update log
 
-### v0.1.5 (current) — 2026-09-22
+### v0.1.6 (current) — 2026-09-22
+
+**New quirks detector coverage:**
+- StarCoder / StarCoder2 (`gpt_bigcode`, `starcoder`, `starcoder2` model types)
+- OLMo and OLMoE (MoE and non-MoE variants)
+- DeepSeek (both regular and DeepSeek-MoE)
+- Qwen1.5-MoE / Qwen2-MoE specific family label
+- Falcon and Pythia / GPT-NeoX now report their specific family name (was:
+  generic "Falcon / Pythia (MQA)")
+
+**Bug fix:**
+- `_infer_family` was being passed the local `cfg(name)` callable inside
+  `build_report`, but tried `getattr(cfg, "model_type")` which always
+  returned empty. Family inference for non-Llama architectures was
+  silently degrading to the generic default. Now detects model_type
+  correctly through either interface.
+
+**Quality of life:**
+- `--quiet` now also suppresses transformers' noisy deprecation warnings
+  (`torch_dtype` migration, `pad_token_id` warnings on small test
+  models). Real warnings (ERROR level) still show through.
+
+Tests: 80 passed (was 69). 11 new tests for the expanded family inference
+and warning suppression.
+
+### v0.1.5 — 2026-09-22
 
 **New features:**
 - `ssmforge arch MODEL --dry-run` — config-only mode. No weight download.

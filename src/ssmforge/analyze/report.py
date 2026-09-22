@@ -469,21 +469,37 @@ def _build_profile(quirks: QuirkReport, cfg, model_id: str) -> dict:
 
 
 def _infer_family(quirks: QuirkReport, cfg, model_id: str) -> str:
-    """Infer the architecture family from quirks + model_id."""
+    """Infer the architecture family from quirks + model_id.
+
+    `cfg` may be either a real config object (with attributes) or the
+    `cfg(name)` callable used inside `build_report` / `build_report_from_config`.
+    Handle both.
+    """
     mid = (model_id or "").lower()
-    arch = (getattr(cfg, "model_type", "") or "").lower()
+    # cfg may be a callable (the local `cfg` inside build_report) or a real
+    # config object. Try both lookups.
+    if callable(cfg) and not isinstance(cfg, type):
+        arch = (cfg("model_type", "") or "").lower()
+    else:
+        arch = (getattr(cfg, "model_type", "") or "").lower()
 
     # MoE models
     if quirks.moe:
-        if "mixtral" in mid:
+        if "mixtral" in mid or "mixtral" in arch:
             return "Mixtral (MoE Llama)"
-        return f"MoE ({arch or 'unknown'})"
+        if "olmoe" in mid or "olmoe" in arch:
+            return "OLMoE (MoE)"
+        if "deepseek" in mid or "deepseek" in arch:
+            return f"DeepSeek-MoE (num_experts={quirks.num_experts})"
+        if "qwen" in mid or "qwen" in arch:
+            return f"Qwen-MoE (num_experts={quirks.num_experts})"
+        return f"MoE ({arch or 'unknown'}, {quirks.num_experts} experts)"
 
     # Fused QKV → Phi-3
     if quirks.fused_qkv:
         return "Phi-3 (fused QKV + fused gate/up)"
 
-    # Sliding window → Mistral / Gemma2
+    # Sliding window + GeGLU → Gemma2
     if quirks.sliding_window and "gemma" in arch:
         return f"Gemma2 ({arch})"
     if quirks.sliding_window:
@@ -497,17 +513,35 @@ def _infer_family(quirks: QuirkReport, cfg, model_id: str) -> str:
     if quirks.layer_scale:
         return "Phi (LayerScale)"
 
+    # StarCoder / multi-query with GELU activation → StarCoder
+    if arch in ("gpt_bigcode", "starcoder", "starcoder2"):
+        return f"StarCoder (multi-query, {arch})"
+
+    # OLMo / OLMoE
+    if arch in ("olmo", "olmoe"):
+        if quirks.moe:
+            return f"OLMoE (MoE)"
+        return f"OLMo ({arch})"
+
     # Tied embeddings + attention bias → Qwen2
     if quirks.tied_embeddings and quirks.attention_bias:
         return "Qwen2 (tied embeddings + attention bias)"
 
     # MQA → Falcon / Pythia
     if quirks.mqa:
-        return "Falcon / Pythia (MQA)"
+        if "falcon" in arch or "falcon" in mid:
+            return "Falcon (MQA)"
+        if "gpt_neox" in arch or "pythia" in mid:
+            return "Pythia / GPT-NeoX (MQA)"
+        return "Multi-Query Attention (kv_heads=1)"
 
     # Partial RoPE → Command-R
     if quirks.partial_rope_factor:
         return "Command-R (partial RoPE)"
+
+    # DeepSeek (non-MoE)
+    if "deepseek" in mid or "deepseek" in arch:
+        return f"DeepSeek ({arch})"
 
     # GPT-2 / BERT pattern (LayerNorm + GELU)
     if quirks.norm_type == "layer" and quirks.mlp_type == "gelu":

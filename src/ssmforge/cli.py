@@ -233,6 +233,30 @@ def _install_signal_handlers() -> None:
         pass
 
 
+def _quiet_transformers_warnings() -> None:
+    """Reduce noise from transformers' internal logging.
+
+    The `torch_dtype` deprecation warning fires on every from_pretrained
+    call. For a tool that's already migrated to `dtype=`, the warning
+    is just clutter. We move the transformers logger to ERROR-level
+    when --quiet is on, and leave WARNING-level visible otherwise so
+    users still see real problems.
+
+    Also silences the 'pad_token_id' / 'generation_config' warnings that
+    fire on some small test models.
+    """
+    try:
+        import logging
+        import transformers
+        # Don't downgrade below WARNING — we want to see actual errors.
+        # But the deprecation flood is at INFO/DEBUG.
+        for name in ("transformers", "transformers.modeling_utils",
+                     "transformers.configuration_utils", "transformers.tokenization_utils_base"):
+            logging.getLogger(name).setLevel(logging.ERROR)
+    except ImportError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the `ssmforge` command."""
     _install_signal_handlers()
@@ -312,6 +336,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "arch":
+        # Suppress transformers' torch_dtype deprecation noise when user wants clean output
+        if getattr(args, "quiet", False):
+            _quiet_transformers_warnings()
         return _cmd_arch(args)
     elif args.command == "doctor":
         return _cmd_doctor(args)
