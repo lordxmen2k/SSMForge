@@ -1,16 +1,29 @@
-"""Scan a HuggingFace model state dict for architectural quirks.
+"""Scan a HuggingFace model state dict + config for architectural quirks.
 
-Detects features that affect downstream conversion/compatibility:
+Comprehensive detection across HF architectures (Llama, Qwen2, Phi-3, Mistral,
+Gemma, Gemma2, Mixtral, GPT-2, Falcon, DeepSeek, Command-R, etc.).
+
+State-dict-based quirks (look at actual weights):
 - attention_bias: presence of q/k/v/o_proj.bias
 - tied_embeddings: lm_head.weight == embed_tokens.weight
-- fused_qkv: single qkv_proj.weight instead of separate q/k/v_proj
-- fused_gate_up: single gate_up_proj.weight instead of separate gate/up_proj
+- fused_qkv: single qkv_proj.weight instead of separate q/k/v_proj (Phi-3)
+- fused_gate_up: single gate_up_proj.weight instead of separate gate/up (Phi-3)
 - moe: presence of expert/router/switch tensors
-- grouped_attention: K/V projection outputs are smaller than Q (num_kv_heads < num_attention_heads)
+- grouped_attention: K/V projection outputs are smaller than Q
+- mqa: K/V projection outputs are equal to head_dim (kv_heads=1, Falcon/Pythia)
+- mlp_type: SwiGLU (gate+up) vs GeLU (single up) vs GeGLU (gate_up fused)
+- norm_type: RMSNorm (single weight) vs LayerNorm (weight + bias)
 
-Detection is heuristic — based on key names, presence/absence, and tensor
-shapes. Does not require the model to be loaded into memory; works on the
-state dict dict.
+Config-based quirks (look at config attributes):
+- sliding_window: Mistral/Mistral-7B has window=4096
+- layer_scale: Phi-3 has learnable per-channel scale on residual
+- soft_capping: Gemma2 has logit soft-capping
+- partial_rope: Command-R has partial RoPE factor
+- num_experts / moe_top_k: Mixtral has 8 experts, top-2 routing
+- rope_theta: from config.rope_theta OR config.rope_scaling.rope_theta
+
+Detection is heuristic — based on key names, presence/absence, tensor shapes,
+and config attributes. Designed to be robust across HF transformers versions.
 """
 
 from __future__ import annotations
@@ -22,26 +35,38 @@ from typing import Any
 
 @dataclass
 class QuirkReport:
-    """Summary of architectural quirks detected in a state dict."""
+    """Comprehensive architectural quirk detection report."""
 
+    # State-dict-based quirks (most reliable)
     attention_bias: bool = False
     tied_embeddings: bool = False
     fused_qkv: bool = False
     fused_gate_up: bool = False
     moe: bool = False
     grouped_attention: bool = False
+    mqa: bool = False  # Multi-Query Attention: kv_heads=1
 
-    # Specifics for transparency
+    # Specifics
     bias_keys_found: list[str] = field(default_factory=list)
     fused_keys_found: list[str] = field(default_factory=list)
     moe_keys_found: list[str] = field(default_factory=list)
 
+    # Derived: MLP type and norm type from state dict structure
+    mlp_type: str = "unknown"  # "swiglu" | "gelu" | "geglu" | "unknown"
+    norm_type: str = "unknown"  # "rms" | "layer" | "unknown"
+
+    # Config-based quirks
+    sliding_window: int | None = None  # None = not used; int = window size
+    layer_scale: bool = False  # Phi-3 has learnable per-channel scale
+    soft_capping: dict[str, float] = field(default_factory=dict)  # Gemma2 attn/logits caps
+    partial_rope_factor: float | None = None  # Command-R
+    num_experts: int | None = None  # MoE
+    moe_top_k: int | None = None  # MoE routing
+    rope_theta: float | None = None  # Resolved from rope_theta OR rope_scaling
+    rope_scaling_type: str | None = None  # "default" | "linear" | "yarn" | etc.
+
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-def _all_keys_with_prefix(state_dict: dict, prefix: str) -> list[str]:
-    return [k for k in state_dict if k.startswith(prefix)]
 
 
 def _layer_zero_keys(state_dict: dict, layer_prefix: str = "model.layers.0.") -> list[str]:
@@ -49,11 +74,84 @@ def _layer_zero_keys(state_dict: dict, layer_prefix: str = "model.layers.0.") ->
     return [k for k in state_dict if k.startswith(layer_prefix)]
 
 
-def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkReport:
-    """Analyze a state dict and return a QuirkReport.
+def _infer_num_layers(state_dict: dict) -> int:
+    """Infer the number of layers from state dict keys."""
+    layer_indices = set()
+    for k in state_dict:
+        if k.startswith("model.layers."):
+            rest = k[len("model.layers."):]
+            if "." in rest:
+                idx = rest.split(".", 1)[0]
+                if idx.isdigit():
+                    layer_indices.add(int(idx))
+    return max(layer_indices) + 1 if layer_indices else 0
+
+
+def _detect_mlp_type(layer0_keys: list[str]) -> str:
+    """Detect MLP type from layer 0's MLP key patterns.
+
+    - "swiglu": gate_proj + up_proj + down_proj (Llama, Qwen2, Mistral)
+    - "gelu":  fc_in + fc_out, no gate (GPT-2, BERT, Falcon)
+    - "geglu": gate_up_proj + down_proj (Phi-3 fused gate+up)
+    - "unknown": none of the above matched
+    """
+    has_gate = any("mlp.gate_proj" in k for k in layer0_keys)
+    has_up = any("mlp.up_proj" in k for k in layer0_keys)
+    has_gate_up_fused = any("mlp.gate_up_proj" in k for k in layer0_keys)
+    has_fc_in = any("mlp.fc_in" in k for k in layer0_keys)
+    has_fc_out = any("mlp.fc_out" in k for k in layer0_keys)
+
+    if has_gate_up_fused:
+        return "geglu"
+    elif has_gate and has_up:
+        return "swiglu"
+    elif has_fc_in and has_fc_out:
+        return "gelu"
+    return "unknown"
+
+
+def _detect_norm_type(layer0_keys: list[str]) -> str:
+    """Detect normalization type from layer 0's norm keys.
+
+    - "rms": input_layernorm.weight only (Llama, Qwen2, Mistral)
+    - "layer": input_layernorm.weight + input_layernorm.bias (GPT-2, BERT)
+    - "unknown": no norm found
+    """
+    has_weight = any(k.endswith("input_layernorm.weight") for k in layer0_keys)
+    has_bias = any(k.endswith("input_layernorm.bias") for k in layer0_keys)
+
+    if has_weight and has_bias:
+        return "layer"
+    elif has_weight:
+        return "rms"
+    return "unknown"
+
+
+def _resolve_rope_theta_from_config(config: Any) -> tuple[float | None, str | None]:
+    """Resolve rope_theta from config, handling legacy and new locations.
+
+    Returns (value, source) where source is "config.rope_theta" or
+    "config.rope_scaling.rope_theta" or None if neither found.
+    """
+    direct = getattr(config, "rope_theta", None)
+    if direct is not None:
+        return float(direct), "config.rope_theta"
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        scaled = rope_scaling.get("rope_theta")
+        if scaled is not None:
+            return float(scaled), "config.rope_scaling.rope_theta"
+
+    return None, None
+
+
+def scan_state_dict(state_dict: dict, config: Any = None, num_layers: int | None = None) -> QuirkReport:
+    """Comprehensive quirk detection from state dict + config.
 
     Args:
         state_dict: model.state_dict() from a HuggingFace model.
+        config: optional HuggingFace config object (enables config-based quirks).
         num_layers: explicit layer count (optional, inferred from state_dict if not given).
 
     Returns:
@@ -64,24 +162,17 @@ def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkRep
     if not state_dict:
         return report
 
-    # Infer layer count if not given
+    # Infer layer count
     if num_layers is None:
-        layer_indices = set()
-        for k in state_dict:
-            if k.startswith("model.layers."):
-                rest = k[len("model.layers."):]
-                if "." in rest:
-                    idx = rest.split(".", 1)[0]
-                    if idx.isdigit():
-                        layer_indices.add(int(idx))
-        num_layers = max(layer_indices) + 1 if layer_indices else 0
+        num_layers = _infer_num_layers(state_dict)
 
     if num_layers == 0:
         return report
 
-    # ---- Attention bias ----
-    # Sample layer 0 only — assume consistency across layers (true for all known HF models)
+    # ===== State-dict-based quirks =====
     layer0_keys = _layer_zero_keys(state_dict)
+
+    # ---- Attention bias ----
     bias_keys = [
         k for k in layer0_keys
         if "self_attn." in k and k.endswith(".bias")
@@ -90,7 +181,7 @@ def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkRep
         report.attention_bias = True
         report.bias_keys_found = sorted(bias_keys)
 
-    # ---- Fused QKV (Phi-3 uses qkv_proj instead of q/k/v_proj) ----
+    # ---- Fused QKV (Phi-3) ----
     fused_qkv_keys = [
         k for k in layer0_keys
         if "self_attn.qkv_proj.weight" in k
@@ -99,7 +190,7 @@ def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkRep
         report.fused_qkv = True
         report.fused_keys_found.extend(sorted(fused_qkv_keys))
 
-    # ---- Fused gate/up (Phi-3 fuses gate_proj + up_proj into gate_up_proj) ----
+    # ---- Fused gate/up (Phi-3) ----
     fused_gate_up_keys = [
         k for k in layer0_keys
         if "mlp.gate_up_proj.weight" in k
@@ -108,10 +199,7 @@ def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkRep
         report.fused_gate_up = True
         report.fused_keys_found.extend(sorted(fused_gate_up_keys))
 
-    # ---- Grouped attention (K/V smaller than Q) ----
-    # Q: shape (n_heads * head_dim, hidden)
-    # K: shape (n_kv_heads * head_dim, hidden)
-    # If K/V projection's output dim is smaller than Q's, it's grouped.
+    # ---- Grouped attention & MQA ----
     q_weight_key = None
     k_weight_key = None
     for k in layer0_keys:
@@ -123,33 +211,35 @@ def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkRep
     if q_weight_key and k_weight_key:
         q_shape = state_dict[q_weight_key].shape
         k_shape = state_dict[k_weight_key].shape
-        # Both should have shape[1] == hidden_size
         if len(q_shape) >= 2 and len(k_shape) >= 2 and q_shape[1] == k_shape[1]:
             if q_shape[0] != k_shape[0]:
+                # K/V smaller than Q — grouped (GQA) or multi-query (MQA)
                 report.grouped_attention = True
+                # MQA: K/V output dim == head_dim (very small, kv_heads=1)
+                # If we have config, we can be more precise
+                if config is not None:
+                    n_heads = getattr(config, "num_attention_heads", 1)
+                    n_kv_heads = getattr(config, "num_key_value_heads", n_heads)
+                    if n_kv_heads == 1 and n_heads > 1:
+                        report.mqa = True
+                else:
+                    # Heuristic: K/V output dim is exactly head_dim-sized
+                    # (qkv_groups = q/k ratio is very large)
+                    q_out = q_shape[0]
+                    k_out = k_shape[0]
+                    if q_out > 0 and k_out > 0 and (q_out / k_out) >= 8:
+                        report.mqa = True
 
-    # ---- MoE (presence of expert / router / switch tensors) ----
-    moe_indicators = ["expert", "router", "switch", "gate_proj"]
-    moe_keys = [
-        k for k in state_dict
-        if any(ind in k.lower() for ind in moe_indicators)
-        # Filter false positives: mlp.gate_proj is standard FFN, not MoE routing
-        and not (
-            "mlp.gate_proj" in k and "mlp.up_proj" in state_dict
-        )
-    ]
-    # Stronger signal: explicit MoE keys like "block_sparse_moe" or ".experts."
+    # ---- MoE ----
     moe_keys = [
         k for k in state_dict
         if "block_sparse_moe" in k or ".experts." in k or ".router." in k
     ]
     if moe_keys:
         report.moe = True
-        report.moe_keys_found = sorted(set(moe_keys))[:5]  # cap for readability
+        report.moe_keys_found = sorted(set(moe_keys))[:5]
 
-    # ---- Tied embeddings (lm_head.weight == embed_tokens.weight) ----
-    # Detect by: either (a) lm_head missing entirely OR (b) lm_head is identical
-    # tensor to embed_tokens (same data_ptr when both are torch tensors).
+    # ---- Tied embeddings ----
     embed_key = None
     head_key = None
     for k in state_dict:
@@ -159,22 +249,70 @@ def scan_state_dict(state_dict: dict, num_layers: int | None = None) -> QuirkRep
             head_key = k
 
     if embed_key is not None and head_key is None:
-        # lm_head missing entirely — strong signal of tied embeddings
         report.tied_embeddings = True
     elif embed_key is not None and head_key is not None:
-        # Check if they're the same tensor (sharing storage)
         e = state_dict[embed_key]
         h = state_dict[head_key]
         if hasattr(e, "data_ptr") and hasattr(h, "data_ptr"):
             if e.data_ptr() == h.data_ptr():
                 report.tied_embeddings = True
-        # Also check by values for numpy arrays
         elif hasattr(e, "ctypes") and hasattr(h, "ctypes"):
             if e.ctypes.data == h.ctypes.data:
                 report.tied_embeddings = True
-        # If we can't compare storage, fall back to identity
         elif id(e) == id(h):
             report.tied_embeddings = True
+
+    # ---- MLP type ----
+    report.mlp_type = _detect_mlp_type(layer0_keys)
+
+    # ---- Norm type ----
+    report.norm_type = _detect_norm_type(layer0_keys)
+
+    # ===== Config-based quirks =====
+    if config is not None:
+        # Sliding window attention (Mistral)
+        sliding_window = getattr(config, "sliding_window", None)
+        if sliding_window is not None and int(sliding_window) > 0:
+            report.sliding_window = int(sliding_window)
+
+        # LayerScale (Phi-3)
+        # Phi-3 has learnable per-channel scale on residual connections.
+        # Detected by presence of `*.ls1.weight`, `*.ls2.weight` keys.
+        ls_keys = [k for k in state_dict if ".ls1.weight" in k or ".ls2.weight" in k]
+        if ls_keys:
+            report.layer_scale = True
+
+        # Soft capping (Gemma2)
+        attn_cap = getattr(config, "attn_logit_softcapping", None)
+        final_cap = getattr(config, "final_logit_softcapping", None)
+        if attn_cap is not None or final_cap is not None:
+            caps = {}
+            if attn_cap is not None:
+                caps["attn_logit_softcapping"] = float(attn_cap)
+            if final_cap is not None:
+                caps["final_logit_softcapping"] = float(final_cap)
+            report.soft_capping = caps
+
+        # Partial RoPE factor (Command-R)
+        rope_factor = getattr(config, "partial_rotary_factor", None)
+        if rope_factor is not None and float(rope_factor) < 1.0:
+            report.partial_rope_factor = float(rope_factor)
+
+        # MoE specifics
+        if report.moe:
+            n_experts = getattr(config, "num_local_experts", None) or getattr(config, "num_experts", None)
+            if n_experts is not None:
+                report.num_experts = int(n_experts)
+            top_k = getattr(config, "num_experts_per_tok", None) or getattr(config, "moe_top_k", None)
+            if top_k is not None:
+                report.moe_top_k = int(top_k)
+
+        # RoPE theta + scaling type
+        rope_theta, rope_source = _resolve_rope_theta_from_config(config)
+        report.rope_theta = rope_theta
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            report.rope_scaling_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
 
     return report
 
@@ -197,8 +335,10 @@ def count_state_dict_summary(state_dict: dict) -> dict:
         "mlp_weights": lambda k: "mlp." in k and k.endswith(".weight"),
         "mlp_biases": lambda k: "mlp." in k and k.endswith(".bias"),
         "layer_norms": lambda k: k.endswith("_layernorm.weight"),
+        "layer_norm_biases": lambda k: k.endswith("_layernorm.bias"),
         "ssm_weights": lambda k: ".mamba." in k or ".ssm." in k,
         "moe_weights": lambda k: ".experts." in k or ".router." in k,
+        "layer_scales": lambda k: ".ls1.weight" in k or ".ls2.weight" in k,
     }
 
     for cat_name, predicate in categories.items():
@@ -210,8 +350,6 @@ def count_state_dict_summary(state_dict: dict) -> dict:
                 param_count += int(t.numel())
             elif hasattr(t, "size"):
                 param_count += int(t.size)
-            else:
-                param_count += 0
         summary["tensor_breakdown"][cat_name] = len(matching_keys)
         summary["param_breakdown"][cat_name] = param_count
         summary["total_params"] += param_count

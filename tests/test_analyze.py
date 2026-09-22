@@ -318,3 +318,74 @@ def test_compatibility_notes_have_required_fields():
         assert "quirk" in issue
         assert "message" in issue
         assert issue["severity"] in ("info", "warning", "error")
+
+
+def test_resolves_rope_theta_from_scaling_dict():
+    """Qwen2 stores rope_theta in rope_scaling dict, not as a direct field.
+
+    This was the silent bug that produced gibberish output: GGUF writer
+    was defaulting to 10000.0 for Qwen2-1.5B when its actual rope_theta
+    is 1,000,000.0.
+    """
+    from types import SimpleNamespace
+
+    # Qwen2-style: direct field is None, rope_scaling has the value
+    cfg = SimpleNamespace(
+        model_type="qwen2", architectures=["Qwen2ForCausalLM"],
+        vocab_size=100, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=2048,
+        rope_theta=None,
+        rope_scaling={"rope_theta": 1000000.0, "rope_type": "default"},
+        rms_norm_eps=1e-6, tie_word_embeddings=True, attention_bias=True,
+        torch_dtype="bfloat16",
+    )
+    sd = _fake_state_dict_qwen2()
+    report = build_report("test/qwen2", cfg, sd)
+    assert report["config"]["rope_theta"] == 1000000.0
+    assert report["config"]["rope_theta_source"] == "config.rope_scaling.rope_theta"
+
+
+def test_resolves_rope_theta_from_direct_field():
+    """Llama-style: rope_theta is a direct field, no rope_scaling."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(
+        model_type="llama", architectures=["LlamaForCausalLM"],
+        vocab_size=100, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        rms_norm_eps=1e-6, tie_word_embeddings=False, attention_bias=False,
+        torch_dtype="float32",
+    )
+    sd = _fake_state_dict_llama()
+    report = build_report("test/llama", cfg, sd)
+    assert report["config"]["rope_theta"] == 10000.0
+    assert report["config"]["rope_theta_source"] == "config.rope_theta"
+
+
+def test_reports_attention_bias_from_state_dict_when_config_missing():
+    """Config doesn't expose attention_bias but state_dict has biases.
+
+    Some HF configs (Qwen2 in older transformers) have attention_bias=None
+    at the config level, but the actual weights ship with biases. The
+    report should show the truth (state_dict detected) rather than the
+    config default (False).
+    """
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(
+        model_type="qwen2", architectures=["Qwen2ForCausalLM"],
+        vocab_size=100, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=2048,
+        rope_theta=None, rope_scaling={"rope_theta": 1000000.0, "rope_type": "default"},
+        rms_norm_eps=1e-6, tie_word_embeddings=True,
+        attention_bias=None,  # config doesn't expose this
+        torch_dtype="bfloat16",
+    )
+    sd = _fake_state_dict_qwen2()  # has biases
+    report = build_report("test/qwen2", cfg, sd)
+    # The state_dict has biases; report should reflect that
+    assert report["config"]["attention_bias"] is True
+    assert report["quirks"]["attention_bias"] is True

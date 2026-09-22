@@ -33,7 +33,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="ssmforge",
         description=(
-            "Convert pretrained transformers to hybrid SSM/attention models.\n\n"
+            "Standalone HF architecture analyzer + hybrid SSM/attention converter.\n\n"
+            "Use `ssmforge arch MODEL` to inspect any HuggingFace model — reports\n"
+            "quirks like attention biases, fused QKV, MoE, sliding window,\n"
+            "LayerScale, soft-capping, partial RoPE, MLP type, and norm type.\n"
+            "Use `ssmforge convert MODEL` to produce a hybrid SSM/attention GGUF.\n\n"
             "WARNING: experimental. Output quality unverified. Not for production.\n"
             "SSMForge GGUFs only load via `ssmforge run` (pure PyTorch) — they\n"
             "do NOT load in ollama / LM Studio / stock llama.cpp (yet)."

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ssmforge"
 version = "0.2.1"
-description = "Convert pretrained transformers to hybrid SSM/attention models. Export quantized GGUF."
+description = "Standalone HF architecture analyzer (`ssmforge arch`) for inspecting pretrained transformers — attention biases, fused QKV, MoE, sliding window, LayerScale, soft-capping, partial RoPE, MLP type, norm type. Outputs structured JSON + human-readable summary. Also converts to hybrid SSM/attention GGUF (Llama/Mistral/Qwen2/Phi-3/Gemma2). Experimental."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"

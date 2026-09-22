@@ -1,36 +1,47 @@
 # SSMForge
 
-**Convert any pretrained transformer into a hybrid SSM/attention model. Smaller, faster, longer context. Exports quantized GGUF.**
+**Standalone `ssmforge arch` CLI: inspect any HuggingFace model and report
+architectural quirks that affect conversion (attention biases, fused QKV,
+MoE, sliding window, LayerScale, soft-capping, partial RoPE, MLP type,
+norm type). Outputs structured JSON + human-readable summary. Run before
+converting any model.**
+
+Also includes the conversion pipeline: convert pretrained transformers to
+hybrid SSM/attention GGUF (Llama / Mistral / Qwen2 / Phi-3 / Gemma2),
+self-contained pure-PyTorch runtime, vendored llama-quantize for Q4_K_M
+output.
 
 [![PyPI version](https://img.shields.io/pypi/v/ssmforge.svg)](https://pypi.org/project/ssmforge/)
 [![Python versions](https://img.shields.io/pypi/pyversions/ssmforge.svg)](https://pypi.org/project/ssmforge/)
 [![License](https://img.shields.io/pypi/l/ssmforge.svg)](https://github.com/lordxmen2k/SSMForge/blob/main/LICENSE)
 [![Downloads](https://img.shields.io/pypi/dm/ssmforge.svg)](https://pypi.org/project/ssmforge/#files)
-[![Tests](https://img.shields.io/badge/tests-70%20passed-brightgreen.svg)](https://github.com/lordxmen2k/SSMForge)
+[![Tests](https://img.shields.io/badge/tests-147%20passed-brightgreen.svg)](https://github.com/lordxmen2k/SSMForge)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+
+## Inspect a model's architecture before converting
 
 ```bash
 pip install "ssmforge[export]"
+
+# Pre-flight check: what quirks does this model have?
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --output qwen2-report.json
+cat qwen2-report.json
 ```
 
-For native CUDA Mamba2 (Python 3.10–3.12 only):
+`ssmforge arch` reports on attention biases, fused QKV / fused gate-up
+projections, tied embeddings, grouped attention (GQA), multi-query
+attention (MQA), MoE, sliding window, LayerScale, soft-capping, partial
+RoPE, MLP type, and norm type — all from the actual model weights, not
+just config defaults. Use it before running any conversion to know what
+the pipeline will and won't handle.
+
+## Convert a model (experimental)
 
 ```bash
-pip install "ssmforge[export,mamba]"
-```
-
-```python
-from ssmforge import convert
-
-result = convert(
-    source="meta-llama/Llama-3.1-8B-Instruct",
-    recipe="hybrid-25",
-    quantize="Q4_K_M",
-    output_dir="./out",
-)
-
-print(f"GGUF:     {result.gguf_path}")
-print(f"Manifest: {result.manifest_path}")
+ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
+    --recipe hybrid-25 \
+    --quantize Q4_K_M \
+    --output ./out
 ```
 
 The result is a **hybrid SSM/attention** GGUF that loads via SSMForge's own
