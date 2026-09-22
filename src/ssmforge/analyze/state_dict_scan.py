@@ -128,15 +128,30 @@ def _detect_norm_type(layer0_keys: list[str]) -> str:
 
 
 def _resolve_rope_theta_from_config(config: Any) -> tuple[float | None, str | None]:
-    """Resolve rope_theta from config, handling legacy and new locations.
+    """Resolve rope_theta from config, handling all the places it lives.
 
-    Returns (value, source) where source is "config.rope_theta" or
-    "config.rope_scaling.rope_theta" or None if neither found.
+    transformers ≥ 5.0 introduced `rope_parameters` as a unified home for
+    RoPE config (supersedes both `rope_theta` and the legacy `rope_scaling`
+    dict). Older configs have `rope_theta` directly. `rope_scaling` (when
+    not None and not just a default) typically carries a base + factor
+    pair for NTK-aware scaling.
+
+    Returns (value, source) where source identifies which field the value
+    came from. Returns (None, None) if no rope_theta can be found.
     """
+    # 1. Direct field (transformers < 4.45)
     direct = getattr(config, "rope_theta", None)
     if direct is not None:
         return float(direct), "config.rope_theta"
 
+    # 2. rope_parameters dict (transformers ≥ 5.0 — unified location)
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        rp_theta = rope_parameters.get("rope_theta")
+        if rp_theta is not None:
+            return float(rp_theta), "config.rope_parameters.rope_theta"
+
+    # 3. rope_scaling dict (legacy transformers 4.45+ — Qwen2 puts it here)
     rope_scaling = getattr(config, "rope_scaling", None)
     if isinstance(rope_scaling, dict):
         scaled = rope_scaling.get("rope_theta")

@@ -228,6 +228,9 @@ def _format_rope_theta(config: Any, quirks: QuirkReport) -> tuple[float | None, 
         direct = getattr(config, "rope_theta", None) if config else None
         if direct is not None:
             return float(direct), "config.rope_theta"
+        rope_parameters = getattr(config, "rope_parameters", None) if config else None
+        if isinstance(rope_parameters, dict) and rope_parameters.get("rope_theta") is not None:
+            return float(rope_parameters["rope_theta"]), "config.rope_parameters.rope_theta"
         return quirks.rope_theta, "config.rope_scaling.rope_theta"
     return None, "defaulted"
 

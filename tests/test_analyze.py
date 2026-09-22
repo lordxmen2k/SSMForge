@@ -346,6 +346,57 @@ def test_resolves_rope_theta_from_scaling_dict():
     assert report["config"]["rope_theta_source"] == "config.rope_scaling.rope_theta"
 
 
+def test_resolves_rope_theta_from_parameters_dict():
+    """transformers ≥ 5.0 stores rope_theta in `rope_parameters` (unified).
+
+    Bug surfaced by running `ssmforge arch TinyLlama/TinyLlama-1.1B-Chat-v1.0`:
+    the report said source = "config.rope_scaling.rope_theta" but the actual
+    transformers source for that value was `rope_parameters.rope_theta`.
+    `config.rope_theta` returned None because newer transformers moves the
+    top-level rope_theta into `rope_parameters` during config load.
+    """
+    from types import SimpleNamespace
+
+    # transformers ≥ 5.0 style: rope_theta only in rope_parameters
+    cfg = SimpleNamespace(
+        model_type="llama", architectures=["LlamaForCausalLM"],
+        vocab_size=100, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=2048,
+        rope_theta=None,
+        rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+        rope_scaling=None,
+        rms_norm_eps=1e-5, tie_word_embeddings=False, attention_bias=False,
+        torch_dtype="bfloat16",
+    )
+    sd = _fake_state_dict_llama()
+    report = build_report("test/llama5x", cfg, sd)
+    assert report["config"]["rope_theta"] == 10000.0
+    assert report["config"]["rope_theta_source"] == "config.rope_parameters.rope_theta"
+
+
+def test_rope_theta_resolution_priority():
+    """When multiple rope_theta locations exist, direct field wins."""
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        model_type="llama", architectures=["LlamaForCausalLM"],
+        vocab_size=100, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        rope_parameters={"rope_theta": 99999.0},  # should be ignored
+        rope_scaling={"rope_theta": 88888.0},     # should be ignored
+        rms_norm_eps=1e-5, tie_word_embeddings=False, attention_bias=False,
+        torch_dtype="float32",
+    )
+    sd = _fake_state_dict_llama()
+    report = build_report("test/llama", cfg, sd)
+    # Direct field takes priority
+    assert report["config"]["rope_theta"] == 10000.0
+    assert report["config"]["rope_theta_source"] == "config.rope_theta"
+
+
 def test_resolves_rope_theta_from_direct_field():
     """Llama-style: rope_theta is a direct field, no rope_scaling."""
     from types import SimpleNamespace
