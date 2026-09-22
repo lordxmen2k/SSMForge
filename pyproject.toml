@@ -42,5 +42,5 @@ where = ["src"]
 testpaths = ["tests"]
 # Pin basetemp to avoid Windows permission errors when scanning %TEMP%
 # for old test directories. Creates /tmp/pytest-ssmforge/ on first run.
-# Override with `pytest --basetemp=DIR` if this path isn't writable.
+# Override with `pytest --basetemp=DIR` or SSMFORGE_BASETEMP env var.
 addopts = "--basetemp=/tmp/pytest-ssmforge"

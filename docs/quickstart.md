@@ -9,6 +9,23 @@ ssmforge arch <huggingface-model-id>
 That's it. Outputs structured JSON on stdout, human-readable summary on
 stderr.
 
+## Custom model cache (Windows users with small C: drive)
+
+```bash
+# Git Bash
+export HF_HOME=G:/models
+mkdir -p G:/models
+
+ssmforge arch Qwen/Qwen2-0.5B-Instruct
+```
+
+PowerShell equivalent:
+```powershell
+$env:HF_HOME = "G:\models"
+mkdir G:\models
+ssmforge arch Qwen/Qwen2-0.5B-Instruct
+```
+
 ## Examples
 
 ```bash

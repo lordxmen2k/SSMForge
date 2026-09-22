@@ -59,6 +59,24 @@ ssmforge arch mistralai/Mixtral-8x7B-Instruct-v0.1
 echo "Exit: $?"   # 2
 ```
 
+### Custom model cache directory
+
+By default HuggingFace downloads to `~/.cache/huggingface/`. To use a
+different drive or directory (e.g. when your home directory is on a small
+SSD), set `HF_HOME` before running `ssmforge arch`:
+
+```bash
+# Windows / Git Bash
+export HF_HOME=G:/models
+mkdir -p G:/models
+
+ssmforge arch Qwen/Qwen2-0.5B-Instruct
+```
+
+Subsequent runs reuse the cached weights. See
+[Controlling where models are cached](#controlling-where-models-are-cached)
+below for full details.
+
 ## Example output
 
 ```
@@ -120,6 +138,40 @@ pip install ssmforge
 
 Requires Python 3.10+. Pulls in `transformers` and `huggingface_hub` for
 loading HF models. See [INSTALL.md](docs/INSTALL.md) for details.
+
+### Controlling where models are cached
+
+`ssmforge arch` downloads HF models on first use and caches them. By
+default the cache lives at `~/.cache/huggingface/` (Linux/Mac) or
+`%USERPROFILE%\.cache\huggingface\` (Windows). Point it somewhere else
+with the `HF_HOME` environment variable:
+
+```bash
+# Linux / Mac / Git Bash on Windows
+export HF_HOME=G:/models
+ssmforge arch Qwen/Qwen2-1.5B-Instruct
+
+# PowerShell
+$env:HF_HOME = "G:\models"
+ssmforge arch Qwen/Qwen2-1.5B-Instruct
+
+# Persistent across shells
+# PowerShell (admin): setx HF_HOME "G:\models" /M
+# Git Bash / Linux:    echo 'export HF_HOME=G:/models' >> ~/.bashrc
+```
+
+`HF_HOME` is read by the underlying HuggingFace libraries, so this
+controls cache location for `ssmforge arch` AND any other HF tool
+(`transformers`, `huggingface-cli`, etc.). Other useful env vars:
+
+| Variable | Purpose |
+|----------|---------|
+| `HF_HOME` | Root directory for all HF caches (`hub`, `datasets`, etc.) |
+| `HF_HUB_CACHE` | Cache for downloaded model files only |
+| `TRANSFORMERS_CACHE` | Same as `HF_HUB_CACHE` (older transformers versions) |
+| `HF_TOKEN` | HF API token for gated models (e.g. Llama-3, Mistral) |
+
+Models cache under `$HF_HOME/hub/models--ORG--MODEL/snapshots/<sha>/`.
 
 ## Why this exists
 

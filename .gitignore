@@ -23,6 +23,7 @@ venv/
 # Test artifacts
 tests/fixtures/llama-1b-tiny/*.safetensors
 tests/fixtures/llama-1b-tiny/*.bin
+tests/.cache/
 coverage/
 htmlcov/
 
