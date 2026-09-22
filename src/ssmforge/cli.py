@@ -1,4 +1,9 @@
-"""Command-line interface for SSMForge."""
+"""Command-line interface for SSMForge.
+
+The only subcommand is `arch`, which runs the architecture analyzer
+on any HuggingFace model and reports on quirks that affect downstream
+conversion or fine-tuning.
+"""
 
 from __future__ import annotations
 
@@ -7,25 +12,17 @@ import contextlib
 import sys
 from pathlib import Path
 
-from ssmforge import convert
-from ssmforge.exceptions import SSMForgeError
-from ssmforge.recipes import list_recipes
-
 
 @contextlib.contextmanager
 def _arch_load_progress(model_id: str):
-    """Load a HuggingFace model for `ssmforge arch`, with a progress note on stderr.
-
-    Loading large models can take a while (downloading + state dict materialization).
-    Give the user some feedback so they know it didn't hang.
-    """
+    """Load a HuggingFace model for `ssmforge arch`, with a progress note on stderr."""
     print(f"Loading {model_id}... (downloading if not cached)", file=sys.stderr)
     try:
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
         yield model
     finally:
-        pass  # HuggingFace handles cleanup
+        pass
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -33,46 +30,22 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="ssmforge",
         description=(
-            "Standalone HF architecture analyzer + hybrid SSM/attention converter.\n\n"
+            "Architecture analyzer for HuggingFace models.\n\n"
             "Use `ssmforge arch MODEL` to inspect any HuggingFace model — reports\n"
             "quirks like attention biases, fused QKV, MoE, sliding window,\n"
             "LayerScale, soft-capping, partial RoPE, MLP type, and norm type.\n"
-            "Use `ssmforge convert MODEL` to produce a hybrid SSM/attention GGUF.\n\n"
-            "WARNING: experimental. Output quality unverified. Not for production.\n"
-            "SSMForge GGUFs only load via `ssmforge run` (pure PyTorch) — they\n"
-            "do NOT load in ollama / LM Studio / stock llama.cpp (yet)."
+            "Outputs structured JSON + human-readable summary."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    convert_p = subparsers.add_parser("convert", help="Convert a model to hybrid SSM/attention + GGUF")
-    convert_p.add_argument("source", help="HF model id or local path")
-    convert_p.add_argument("--recipe", default="hybrid-25", help="Recipe name (default: hybrid-25)")
-    convert_p.add_argument(
-        "--quantize",
-        default="Q4_K_M",
-        choices=["F16", "Q8_0", "Q5_K_M", "Q4_K_M", "Q4_K_S"],
-        help="GGUF quantization type (default: Q4_K_M)",
-    )
-    convert_p.add_argument("--output", default="./out", help="Output directory (default: ./out)")
-    convert_p.add_argument("--calibration-data", default=None, help="Calibration data source")
-    convert_p.add_argument("--verify", action="store_true", help="Run Stage 6 verification (slow)")
-    convert_p.add_argument("--dry-run", action="store_true", help="Plan only, no export")
-    convert_p.add_argument("--no-distill", action="store_true",
-                           help="Skip distillation stage (default: 2-step stub; --no-distill skips it entirely)")
-    convert_p.add_argument("--experimental", action="store_true", help="Allow experimental recipes")
-    convert_p.add_argument("--strict-verify", action="store_true", help="Promote verify warnings to errors")
-    convert_p.add_argument("--debug", action="store_true", help="Show full tracebacks on error")
-
-    subparsers.add_parser("list-recipes", help="List registered recipes")
-
     arch_p = subparsers.add_parser(
         "arch",
         help=(
             "Inspect a HuggingFace model's architecture and report quirks. "
-            "Use this before ssmforge convert to see if your model has features "
-            "(biases, fused tensors, MoE) that affect conversion."
+            "Detects attention biases, fused tensors, MoE, sliding window, "
+            "LayerScale, soft-capping, partial RoPE, MLP type, and norm type."
         ),
     )
     arch_p.add_argument("source", help="HF model id or local path")
@@ -85,68 +58,9 @@ def main(argv: list[str] | None = None) -> None:
         help="Suppress the human-readable summary; print JSON only",
     )
 
-    run_p = subparsers.add_parser(
-        "run",
-        help="Run inference on an SSMForge GGUF (self-contained, no ollama needed)",
-    )
-    run_p.add_argument("--model", required=True, help="Path to SSMForge GGUF")
-    run_p.add_argument("--prompt", default=None, help="Text prompt (omit for --interactive)")
-    run_p.add_argument("--interactive", action="store_true", help="REPL mode")
-    run_p.add_argument("--max-new-tokens", type=int, default=30)
-    run_p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    run_p.add_argument("--no-quiet", action="store_true", help="Print model metadata")
-    run_p.add_argument(
-        "--output", "-o", default=None,
-        help="Write generated text to this file (UTF-8). Useful on Windows consoles "
-             "that can't print all generated bytes."
-    )
-
     args = parser.parse_args(argv)
 
-    if args.command == "list-recipes":
-        print("Registered recipes:")
-        for name in list_recipes():
-            print(f"  - {name}")
-        sys.exit(0)
-    elif args.command == "run":
-        from ssmforge.runtime.run import main as run_main
-        # Pass through only the args after "run"
-        run_argv = []
-        seen = False
-        for a in (argv or sys.argv[1:]):
-            if seen:
-                run_argv.append(a)
-            elif a == "run":
-                seen = True
-        sys.exit(run_main(run_argv))
-    elif args.command == "convert":
-        print(
-            "WARNING: experimental software. Output quality not verified. "
-            "Not for production environments.",
-            file=sys.stderr,
-        )
-        try:
-            result = convert(
-                source=args.source,
-                recipe=args.recipe,
-                quantize=args.quantize,
-                output_dir=args.output,
-                calibration_data=args.calibration_data,
-                verify=args.verify,
-                dry_run=args.dry_run,
-                experimental=args.experimental,
-                no_distill=args.no_distill,
-            )
-        except SSMForgeError as e:
-            if args.debug:
-                raise
-            print(str(e), file=sys.stderr)
-            sys.exit(1)
-        print(f"GGUF: {result.gguf_path}")
-        print(f"Manifest: {result.manifest_path}")
-        print(f"Stats: {result.stats}")
-        sys.exit(0)
-    elif args.command == "arch":
+    if args.command == "arch":
         from ssmforge.analyze import build_report, format_report_json
         from ssmforge.analyze.summary import render_summary
 

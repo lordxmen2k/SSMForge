@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssmforge"
-version = "0.2.1"
-description = "Standalone HF architecture analyzer (`ssmforge arch`) for inspecting pretrained transformers — attention biases, fused QKV, MoE, sliding window, LayerScale, soft-capping, partial RoPE, MLP type, norm type. Outputs structured JSON + human-readable summary. Also converts to hybrid SSM/attention GGUF (Llama/Mistral/Qwen2/Phi-3/Gemma2). Experimental."
+version = "0.1.0"
+description = "Standalone HF architecture analyzer (`ssmforge arch`). Inspects any HuggingFace model and reports architectural quirks — attention biases, fused QKV/gate-up, tied embeddings, GQA, MQA, MoE, sliding window, LayerScale, soft-capping, partial RoPE, MLP type, norm type. Outputs structured JSON + human-readable summary."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
@@ -20,29 +20,13 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.3",
     "transformers>=4.45",
     "huggingface_hub>=0.24",
-    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-cov>=4.0",
-    "hypothesis>=6.0",
-    "ruff>=0.6",
-]
-export = [
-    "gguf>=0.6",
-]
-mamba = [
-    # mamba-ssm ships prebuilt wheels only for Python 3.9-3.12. On 3.13+ this
-    # extra installs nothing (the parenthesized expression is interpreted as
-    # a marker that always fails, so pip skips it gracefully). See README
-    # and docs/INSTALL.md for the manual install path for 3.10-3.12 users.
-    'mamba-ssm>=2.0; python_version < "3.13"',
-    'causal-conv1d>=1.4; python_version < "3.13"',
 ]
 
 [project.scripts]
@@ -56,7 +40,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "integration: marks integration tests",
-]

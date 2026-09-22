@@ -1,690 +1,138 @@
-# SSMForge
+# SSMForge — `arch`
 
-**Standalone `ssmforge arch` CLI: inspect any HuggingFace model and report
-architectural quirks that affect conversion (attention biases, fused QKV,
-MoE, sliding window, LayerScale, soft-capping, partial RoPE, MLP type,
-norm type). Outputs structured JSON + human-readable summary. Run before
-converting any model.**
+**Architecture analyzer for HuggingFace models.**
 
-Also includes the conversion pipeline: convert pretrained transformers to
-hybrid SSM/attention GGUF (Llama / Mistral / Qwen2 / Phi-3 / Gemma2),
-self-contained pure-PyTorch runtime, vendored llama-quantize for Q4_K_M
-output.
+Standalone CLI that inspects any HuggingFace model and reports architectural
+quirks that affect conversion, fine-tuning, or downstream loading:
+attention biases, fused QKV / fused gate-up projections, tied embeddings,
+grouped attention (GQA), multi-query attention (MQA), MoE, sliding window,
+LayerScale, soft-capping, partial RoPE, MLP type, norm type.
 
-[![PyPI version](https://img.shields.io/pypi/v/ssmforge.svg)](https://pypi.org/project/ssmforge/)
-[![Python versions](https://img.shields.io/pypi/pyversions/ssmforge.svg)](https://pypi.org/project/ssmforge/)
-[![License](https://img.shields.io/pypi/l/ssmforge.svg)](https://github.com/lordxmen2k/SSMForge/blob/main/LICENSE)
-[![Downloads](https://img.shields.io/pypi/dm/ssmforge.svg)](https://pypi.org/project/ssmforge/#files)
-[![Tests](https://img.shields.io/badge/tests-147%20passed-brightgreen.svg)](https://github.com/lordxmen2k/SSMForge)
+Outputs structured JSON + human-readable summary.
+
+[![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)](https://github.com/lordxmen2k/SSMForge)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
-## Inspect a model's architecture before converting
-
 ```bash
-pip install "ssmforge[export]"
+pip install ssmforge
 
-# Pre-flight check: what quirks does this model have?
-ssmforge arch Qwen/Qwen2-1.5B-Instruct --output qwen2-report.json
-cat qwen2-report.json
+ssmforge arch Qwen/Qwen2-1.5B-Instruct
 ```
 
-`ssmforge arch` reports on attention biases, fused QKV / fused gate-up
-projections, tied embeddings, grouped attention (GQA), multi-query
-attention (MQA), MoE, sliding window, LayerScale, soft-capping, partial
-RoPE, MLP type, and norm type — all from the actual model weights, not
-just config defaults. Use it before running any conversion to know what
-the pipeline will and won't handle.
+## What it detects
 
-## Convert a model (experimental)
+| Detector | What it catches | Architectures |
+|----------|-----------------|---------------|
+| `attention_bias` | q/k/v projections have learned bias terms | Qwen2 |
+| `tied_embeddings` | `lm_head` shares storage with `embed_tokens` | Qwen2, Pythia |
+| `fused_qkv` | single `qkv_proj` instead of separate q/k/v | Phi-3 |
+| `fused_gate_up` | single `gate_up_proj` instead of gate+up | Phi-3 |
+| `grouped_attention` (GQA) | K/V projection smaller than Q | Qwen2, Llama-3, Mistral |
+| `mqa` | `kv_heads=1` (multi-query attention) | Falcon, Pythia |
+| `mlp_type` | SwiGLU / GeLU / GeGLU activation family | across the board |
+| `norm_type` | RMSNorm vs LayerNorm | across the board |
+| `sliding_window` | windowed attention config | Mistral, Gemma |
+| `layer_scale` | learnable per-channel residual scale | Phi-3 |
+| `soft_capping` | logit soft-capping values | Gemma2 |
+| `partial_rope` | partial rotary embedding factor | Command-R |
+| `num_experts` / `moe_top_k` | MoE routing config | Mixtral, DeepSeek-MoE |
+| `rope_theta` | resolves from `config.rope_theta` or `config.rope_scaling.rope_theta` | Qwen2 (transformers ≥ 4.45) |
 
-```bash
-ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
-    --recipe hybrid-25 \
-    --quantize Q4_K_M \
-    --output ./out
-```
+Plus an **interpretive profile** (`family`, `attention_type`, `descriptors`)
+that classifies the model into a known family and lists its traits in
+human-readable form.
 
-The result is a **hybrid SSM/attention** GGUF that loads via SSMForge's own
-self-contained runtime (`ssmforge run ...` in pure PyTorch) — see
-[Running the model](#running-the-model).
-
-> ⚠️ **Important: SSMForge GGUFs do NOT load in mainstream runtimes**
-> (yet). Stock `llama.cpp`, `ollama`, LM Studio, etc. don't implement the
-> SSM2 forward kernel so they'll reject the GGUF with errors like
-> `unknown model architecture: 'ssmforge'` or
-> `model created empty tensor graph`.
->
-> **For inference today:** use `ssmforge run --model <gguf> --prompt "..."`
-> (built into this package, no external service needed). It's slower than
-> a C++ kernel would be but it works on any machine with PyTorch.
->
-> **For inference in stock llama.cpp / ollama:** requires implementing the
-> SSM2 chunked SSD forward kernel — planned for v0.3.
-
----
-
-## ⚠️ Experimental — Not for production
-
-**SSMForge is a research/experimental project. Do not use converted models
-in production environments.**
-
-What this means in practice:
-- Output weights are produced by a 2-step distillation stub; trained against
-  the teacher for ~2 batches only. Useful for **pipeline validation**,
-  not for serving to real users.
-- The forward graph in vendored llama.cpp is a stub (the SSM2 chunked SSD
-  kernel is v0.3 work). Inference is via `ssmforge run` in pure PyTorch,
-  slower than a C++ runtime would be.
-- Output quality has **not been measured**. The paper-style numbers in
-  the tables below say "TBD" because they don't exist yet.
-- No support agreements, no version promises, no migration paths.
-- Conversions may produce **worse** outputs than the teacher if the Mamba2
-  layers don't get meaningful training signal during distillation.
-
-If you want a working hybrid model today, use NVIDIA's published Mamba
-recipes in PyTorch directly. We're aiming for that level of quality in
-a future version.
-
----
-
-## What SSMForge does
-
-SSMForge implements the recipes and pipeline described in the published
-literature on hybrid SSM/attention models:
-
-- **MambaInLlama** (NeurIPS 2024) — recipe for `hybrid-25`
-- **Jamba** (AI21, 2024) — recipe for `hybrid-50`
-- **"Attention to Mamba"** (2025) — recipe for `pure-mamba`
-
-Given a pretrained dense transformer (HuggingFace model id or local path),
-SSMForge:
-
-1. Loads the teacher model
-2. Plans which layers become Mamba2 vs stay as attention (per recipe)
-3. Performs state-dict surgery: copies embeddings/MLP/LayerNorm verbatim,
-   replaces marked attention layers with freshly-initialized Mamba2 weights
-4. Distills the result against the teacher using KL divergence
-5. Exports the final model as a quantized GGUF that loads in llama.cpp
-6. Writes a manifest JSON with provenance (source SHA, recipe, layer mapping,
-   output file SHA)
-
-Plus a standalone architecture analyzer (`ssmforge arch`) that inspects any
-HuggingFace model and reports on architectural quirks that affect conversion:
-attention biases, fused QKV/gate-up projections, tied embeddings, MoE,
-grouped attention, and more. Useful as a pre-flight check before running
-`ssmforge convert`.
-
-**The pipeline is real and tested.** 144 unit + integration + property tests
-pass. The CLI works. A real GGUF file is produced and round-trips through
-`gguf-py`. The dry run works on a real HuggingFace model end-to-end.
-
----
-
-## What SSMForge doesn't have (yet)
-
-**No benchmark numbers.** The tables below say "TBD" because we haven't run
-a full conversion on a real large model. The qualitative claims (SSM layers
-have no KV cache, so they save memory at long context) are well-established
-in the literature, but **the specific numbers depend on the model, hardware,
-and distillation recipe** and we cannot honestly quote them for SSMForge
-output without measuring.
-
-**Specific things we don't know yet:**
-- How much speedup SSMForge's `hybrid-25` gets vs the paper's `hybrid-25` on
-  the same hardware (we use a lightweight `torch.optim` distillation loop,
-  not the paper's full step-wise + DPO recipe)
-- Actual quality retention vs the teacher (MMLU, HellaSwag on a real
-  converted model)
-- Whether `pure-mamba` lands at the paper's reported 60-80% retention or worse
-  with our distillation implementation
-
-**To get real numbers:**
+## Usage
 
 ```bash
-# Run a real conversion
-ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
-    --recipe hybrid-25 \
-    --quantize Q4_K_M \
-    --output ./out
+# Basic inspection
+ssmforge arch Qwen/Qwen2-1.5B-Instruct
 
-# Benchmark the output
-python -c "
-from ssmforge.benchmark import benchmark_long_context
-from transformers import AutoModelForCausalLM, AutoTokenizer
-model = AutoModelForCausalLM.from_pretrained('./out/<model-name>')
-tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.1-8B-Instruct')
-results = benchmark_long_context(model, tokenizer, context_lengths=[4096, 32768, 131072])
-for ctx, stats in results.items():
-    print(f'{ctx:>8}: {stats.get(\"tokens_per_sec\", 0):.1f} tok/s, {stats.get(\"peak_memory_mb\", 0):.1f} MB')
-"
+# Save JSON to file
+ssmforge arch mistralai/Mistral-7B-v0.1 --output mistral.json
+
+# JSON only (no human summary)
+ssmforge arch meta-llama/Llama-3.1-8B --quiet | jq .quirks
+
+# MoE models exit with code 2 (incompatible)
+ssmforge arch mistralai/Mixtral-8x7B-Instruct-v0.1
+echo "Exit: $?"   # 2
 ```
 
-PRs with real numbers welcome — that's the highest-value contribution.
+## Example output
 
----
+```
+SSMForge arch report: Qwen/Qwen2-1.5B-Instruct
+  family:              Qwen2 (tied embeddings + attention bias)
+  attention_type:      GQA
+  mlp_type:            swiglu
+  norm_type:           rms
 
-## Disk size (we know this part)
+Model config:
+  hidden_size:         1536
+  num_hidden_layers:   28
+  num_attention_heads: 12
+  num_kv_heads:        2
+  intermediate_size:   8960
+  vocab_size:          151936
+  max_position:        32768
+  rope_theta:          1e+06 (from config.rope_scaling.rope_theta)
+  tie_word_embeddings: True
+  attention_bias:      True
 
-Disk size is dominated by parameter count, not architecture. Every recipe
-keeps the same number of weight parameters, so disk size is determined by
-quant type alone.
+Detected quirks:
+  ✓ attention bias=True
+  ✓ tied embeddings
+  ✗ fused QKV
+  ✗ fused gate/up
+  ✓ GQA
+  ✗ MQA (kv_heads=1)
+  ✗ MoE
+    mlp: swiglu
+    norm: rms
 
-| Quant | Llama-3.2-1B | Llama-3.1-8B | Llama-3.1-70B |
-|-------|--------------|--------------|---------------|
-| F16   | ~2.5 GB      | ~16 GB       | ~140 GB       |
-| Q8_0  | ~1.3 GB      | ~8.5 GB      | ~75 GB        |
-| Q5_K_M | ~900 MB     | ~5.7 GB      | ~50 GB        |
-| Q4_K_M | ~700 MB     | ~4.6 GB      | ~40 GB        |
-| Q4_K_S | ~600 MB     | ~4.0 GB      | ~35 GB        |
+State dict: 339 tensors, 1.78B params
+  embeddings                1 tensors,    233.37M params
+  lm_head                   1 tensors,    233.37M params
+  attention_weights       112 tensors,    154.14M params
+  attention_biases         84 tensors,      57.34K params
+  mlp_weights              84 tensors,      1.16B params
+  layer_norms              56 tensors,      86.02K params
+  final_norm                1 tensors,       1.54K params
 
-These are computable from parameter count. The disk size of an SSMForge
-GGUF at any quant level will match the dense GGUF at the same quant level
-(because both have the same number of weights).
+Compatibility: OK (no blockers)
+  [INFO] attention_bias: Model has bias=True on attention q/k/v projections...
+  [INFO] tied_embeddings: Embeddings are tied to the LM head...
+  [INFO] grouped_attention: K/V projection output dim is smaller than Q's...
+```
 
----
+## Exit codes
 
-## Runtime VRAM at long context (TBD — we haven't measured)
-
-| Variant | Recipe | VRAM @ 4K ctx | VRAM @ 128K ctx | VRAM @ 1M ctx |
-|---------|--------|---------------|------------------|---------------|
-| Llama-3.1-8B dense | — | TBD | TBD | TBD |
-| Llama-3.1-8B hybrid-25 | hybrid-25 | TBD | TBD (expected to be lower than dense) | TBD |
-| Llama-3.1-8B hybrid-50 | hybrid-50 | TBD | TBD | TBD |
-| Llama-3.1-8B pure-mamba | pure-mamba | TBD | TBD (~flat across context, no KV cache) | TBD |
-
-The qualitative claim — SSM recipes use less memory at long context because
-they have fewer KV-cache-producing attention layers — is correct. **The
-specific numbers** depend on the model, batch size, KV cache dtype, and
-distillation-induced differences in the attention layers. We don't have
-SSMForge-specific numbers. Run the benchmark snippet above to get them.
-
----
-
-## Quality retention (TBD)
-
-| Recipe | Quality vs teacher |
-|--------|--------------------|
-| pure-attention | TBD (baseline — round-trips source model through our pipeline unchanged) |
-| dense Q4_K_M (baseline) | TBD (typically ~98% for dense models with llama.cpp's quant) |
-| hybrid-25 | TBD (paper claims ~95-98%, our impl unverified) |
-| hybrid-50 | TBD (paper claims ~90-95%, our impl unverified) |
-| pure-mamba | TBD (paper claims ~60-80%, our impl unverified) |
-
-`pure-attention` is a **diagnostic recipe** that copies all attention layers
-verbatim with no SSM substitution. Use it to verify the conversion pipeline
-(F16 GGUF write → llama-quantize → self-contained loader → forward pass)
-doesn't degrade the source model. If pure-attention produces coherent output
-and hybrid-25 doesn't, the gap is in distillation quality, not conversion.
-
-Run `ssmforge convert ... --verify` and benchmark on lm-evaluation-harness to
-get real numbers for your model.
-
----
+- `0` — analyzed successfully, model is compatible
+- `2` — analyzed successfully, but model is incompatible (currently: MoE)
+- `1` — could not load or analyze the model
 
 ## Install
 
-> **Important:** the `[mamba]` extra only installs `mamba-ssm` on Python
-> 3.9–3.12. On 3.13+ SSMForge uses a pure-PyTorch fallback. See the
-> [Choose your scenario](#choose-your-scenario) section below.
-
-### Quick install (Python 3.9–3.12 with CUDA Mamba)
-
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install "ssmforge[export,mamba]"
-ssmforge --help
+pip install ssmforge
 ```
 
-### Quick install (Python 3.13+, pure-PyTorch fallback)
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install "ssmforge[export]"
-ssmforge --help
-```
-
-The fallback works fine for 1B models. For 3B+ models the CUDA-accelerated
-`[mamba]` extra on Python 3.10–3.12 is meaningfully faster.
-
-### Full install (with `llama-quantize` for Q4_K_M and friends)
-
-```bash
-# 1. Virtual env
-python3 -m venv .venv && source .venv/bin/activate
-
-# 2. Upgrade pip (some envs default to a broken mirror)
-python -m pip install --upgrade pip
-python -m pip config set global.index-url https://pypi.org/simple/
-
-# 3. Install SSMForge
-pip install "ssmforge[export]"
-
-# 4. Install llama-quantize binary (needed for non-F16 quant)
-pip install llama-cpp-python
-# OR build from source:
-#   git clone https://github.com/ggerganov/llama.cpp.git
-#   cd llama.cpp && make llama-quantize
-#   export LLAMA_QUANTIZE_BIN="$(pwd)/llama-quantize"
-```
-
-### Optional: native Mamba2 CUDA kernels
-
-### Choose your scenario
-
-The `[mamba]` extra installs `mamba-ssm` and `causal-conv1d` — the real
-CUDA-accelerated Mamba2 kernels. **Prebuilt wheels exist only for Python
-3.9–3.12**, so the install path differs by Python version. The `[export]`
-extra (which installs `gguf` for GGUF file writing) works on all Python
-versions.
-
-Pick your scenario and run the matching command:
-
-#### Scenario A — Python 3.9, 3.10, 3.11, or 3.12 (recommended for CUDA Mamba)
-
-You get the real CUDA-accelerated Mamba2 kernels.
-
-```bash
-pip install "ssmforge[export,mamba]"
-```
-
-That's it. Verify:
-
-```bash
-pip show mamba-ssm   # should print Name, Version, Summary
-python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
-```
-
-If `pip show mamba-ssm` succeeds, you're on a CUDA-Mamba-enabled install.
-
-#### Scenario B — Python 3.13 or 3.14 (your situation if you're on the latest)
-
-The `[mamba]` extra installs nothing (pip sees the version gate and skips
-`mamba-ssm`). SSMForge uses a pure-PyTorch SSM fallback — works fine, just
-2-3× slower than the real CUDA Mamba. No action needed for a working
-install.
-
-```bash
-pip install "ssmforge[export]"
-```
-
-If you later want the real CUDA Mamba on Python 3.13+, you have two options:
-
-**Option B1 — Try the manual install** (may fail if CUDA toolkit isn't installed):
-
-```bash
-pip install mamba-ssm causal-conv1d --no-build-isolation
-```
-
-If it succeeds, you're done. If it fails with `nvcc not found` or similar,
-you need to install the CUDA toolkit headers (heavy).
-
-**Option B2 — Set up Python 3.11 in a separate venv** (most reliable):
-
-```bash
-# 1. Install Python 3.11 from https://www.python.org/downloads/release/python-31110/
-#    Default Windows path: C:\Python311\
-
-# 2. Create a venv using Python 3.11
-/C/Python311/python.exe -m venv .venv-mamba
-
-# 3. Activate
-source .venv-mamba/Scripts/activate   # Git Bash on Windows
-# .venv-mamba\Scripts\activate       # PowerShell
-
-# 4. Install SSMForge with the [mamba] extra
-python -m pip install --upgrade pip
-pip install "ssmforge[export,mamba]"
-
-# 5. Verify
-pip show mamba-ssm
-python -c "from mamba_ssm import Mamba2; print('Mamba2 OK')"
-```
-
-Now you have two venvs:
-- `.venv/` (Python 3.14) — SSMForge with pure-PyTorch fallback
-- `.venv-mamba/` (Python 3.11) — SSMForge with real CUDA Mamba
-
-Use `.venv-mamba/` when you want CUDA-accelerated SSM distillation (matters
-more for 3B+ models than for 1B).
-
-#### Scenario C — macOS Apple Silicon (M1/M2/M3)
-
-```bash
-pip install "ssmforge[export]"
-```
-
-`mamba-ssm` has no MPS (Metal) wheels. The pure-PyTorch fallback works on
-Apple Silicon but is slow. For real GPU acceleration on Apple Silicon,
-track https://github.com/state-spaces/mamba/issues for MPS support.
-
-### How to tell which mode you're in
-
-Run this any time:
-
-```bash
-python -c "
-import sys
-from ssmforge.models.hybrid_llama_mamba import _MAMBA_AVAILABLE
-print(f'Python:           {sys.version.split()[0]}')
-print(f'Real CUDA Mamba:  {_MAMBA_AVAILABLE}')
-if not _MAMBA_AVAILABLE:
-    print('  → using pure-PyTorch fallback (slower, no CUDA)')
-else:
-    print('  → using mamba-ssm CUDA kernels (fast)')
-"
-```
-
-### Verify
-
-```bash
-ssmforge list-recipes
-python -c "import ssmforge; print(ssmforge.__version__)"
-ssmforge convert hf-internal-testing/tiny-random-LlamaForCausalLM --dry-run
-```
-
-If all of those work, you're ready.
-
-See [INSTALL.md on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/INSTALL.md)
-for the complete guide including troubleshooting, CUDA setup, and PyPI publishing steps.
-
----
-
-## Usage examples
-
-### Example 1: Convert a HuggingFace model to Q4_K_M (most common)
-
-```bash
-ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
-    --recipe hybrid-25 \
-    --quantize Q4_K_M \
-    --output ./out
-```
-
-Output:
-
-```
-./out/meta-llama_Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf
-./out/meta-llama_Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.manifest.json
-```
-
-### Example 2: Inspect a model's architecture before converting
-
-`ssmforge arch` runs the architecture analyzer on a HuggingFace model and
-prints a JSON report on stdout (with a human-readable summary on stderr).
-Use this to check quirks (attention biases, fused QKV, MoE, etc.) before
-running a 30-minute conversion only to find out at inference time that
-something was silently dropped.
-
-```bash
-ssmforge arch Qwen/Qwen2-1.5B-Instruct --output qwen2-report.json
-cat qwen2-report.json
-```
-
-Sample report (Qwen2-1.5B):
-
-```json
-{
-  "model_id": "Qwen/Qwen2-1.5B-Instruct",
-  "model_type": "qwen2",
-  "config": {
-    "vocab_size": 151936,
-    "hidden_size": 1536,
-    "num_hidden_layers": 28,
-    "num_attention_heads": 12,
-    "num_key_value_heads": 2,
-    "intermediate_size": 8960,
-    "tie_word_embeddings": true,
-    "attention_bias": true
-  },
-  "quirks": {
-    "attention_bias": true,
-    "tied_embeddings": true,
-    "fused_qkv": false,
-    "fused_gate_up": false,
-    "grouped_attention": true,
-    "moe": false
-  },
-  "state_dict_summary": {
-    "total_tensors": 387,
-    "total_params": 1543714304
-  },
-  "compatibility": {
-    "is_compatible": true,
-    "issues": [
-      {
-        "severity": "info",
-        "quirk": "attention_bias",
-        "message": "Model has bias=True on attention q/k/v projections. ..."
-      }
-    ]
-  }
-}
-```
-
-The `compatibility` section flags issues BEFORE conversion runs. For example,
-MoE models exit with code 2 and a clear "MoE is not supported" message —
-no need to wait for conversion to fail.
-
-### Example 3: Python API
-
-```python
-from pathlib import Path
-from ssmforge import convert
-
-result = convert(
-    source="meta-llama/Llama-3.1-8B-Instruct",
-    recipe="hybrid-25",                          # pure-attention | hybrid-25 | hybrid-50 | pure-mamba
-    quantize="Q4_K_M",                           # F16 | Q8_0 | Q5_K_M | Q4_K_M | Q4_K_S
-    output_dir=Path("./out"),
-    calibration_data=None,                       # None = built-in default; or path/dataset id
-    verify=False,                                # Stage 6 forward-pass sanity check
-    dry_run=False,                               # True = plan + surgery only
-    experimental=False,                          # True = allow pure-mamba recipe
-)
-```
-
-### Example 3: Dry run — plan only, no distillation or export
-
-```bash
-ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
-    --recipe hybrid-25 \
-    --dry-run
-```
-
-Prints the full layer mapping and exits in ~10 seconds without writing anything.
-
-### Example 4: Custom calibration data
-
-```bash
-ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
-    --recipe hybrid-25 \
-    --quantize Q4_K_M \
-    --calibration-data /path/to/my-text-corpus.txt \
-    --output ./out
-```
-
-The file format is one sample per line. Empty lines are skipped.
-
-```bash
-ssmforge convert meta-llama/Llama-3.1-8B-Instruct \
-    --recipe hybrid-50 \
-    --quantize Q5_K_M \
-    --calibration-data HuggingFaceH4/ultrachat_200k \
-    --output ./out
-```
-
-Any HF dataset id with a `text` field works.
-
-### Example 5: Long-context benchmark (this gives real numbers)
-
-```python
-from ssmforge.benchmark import benchmark_long_context
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model = AutoModelForCausalLM.from_pretrained("path/to/converted-model-dir")
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
-
-results = benchmark_long_context(
-    model,
-    tokenizer,
-    context_lengths=[4_096, 32_768, 131_072],
-)
-for ctx, stats in results.items():
-    if "error" in stats:
-        print(f"{ctx:>8}: ERROR {stats['error']}")
-    else:
-        print(f"{ctx:>8}: {stats['tokens_per_sec']:.1f} tok/s, {stats['peak_memory_mb']:.1f} MB")
-```
-
-### Example 6: Pure Mamba (experimental)
-
-Requires `--experimental` flag. **Expect significant quality loss — the
-research paper reports 60-80% retention vs teacher for the full recipe;
-SSMForge's lightweight distillation impl is unverified.**
-
-```bash
-ssmforge convert meta-llama/Llama-3.2-1B \
-    --recipe pure-mamba \
-    --quantize Q4_K_M \
-    --experimental \
-    --output ./out
-```
-
-### Example 7: Custom recipe
-
-```python
-# my_recipe.py
-from ssmforge.recipes import Recipe, register_recipe
-from ssmforge.config import LayerSpec, LayerType, DistillationConfig, TrainingStage
-
-
-@register_recipe
-class Hybrid75Recipe(Recipe):
-    """Custom: keep 75% attention, only convert middle layers sparsely."""
-    name = "hybrid-75"
-    description = "Sparser SSM replacement — ~12.5% of layers converted"
-    requires_attention_fraction = 0.875
-
-    def plan(self, model):
-        num_layers = model.config.num_hidden_layers
-        return [
-            LayerSpec(
-                layer_type=LayerType.SSM if (i % 8 == 4) else LayerType.ATTENTION,
-                index=i,
-            )
-            for i in range(num_layers)
-        ]
-
-    def distillation_config(self):
-        return DistillationConfig(
-            stages=[TrainingStage(name="e2e", epochs=2, learning_rate=5e-5)]
-        )
-```
-
-```bash
-ssmforge convert <model> --recipe hybrid-75 --quantize Q4_K_M --output ./out
-```
-
-### Example 8: Load the output in llama.cpp / ollama / LM Studio
-
-```bash
-# ollama
-echo 'FROM ./out/Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf' > Modelfile
-ollama create my-hybrid-model -f Modelfile
-ollama run my-hybrid-model
-
-# llama.cpp
-./llama-cli -m ./out/Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.gguf -p "Hello!"
-
-# LM Studio — just open the GGUF file in the UI
-```
-
----
-
-## Recipes
-
-**Reminder:** all recipes are experimental. "Best for" below is the
-recipe's intent; outcomes in production environments have **not** been
-verified.
-
-| Recipe | SSM ratio | Intent |
-|--------|-----------|--------|
-| `hybrid-25` (default) | ~25% | Conservative MambaInLlama-style mix; closest to the published paper |
-| `hybrid-50` | ~50% (1:1 alternation) | Aggressive long-context, no attention-only blocks |
-| `pure-mamba` (requires `--experimental`) | 100% | All-SSM, attention entirely replaced. Quality degradation expected. |
-
-All three preserve the original tokenizer and chat template.
-
-See [recipes.md on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/recipes.md)
-for the full catalog and customization guide.
-
----
-
-## Architecture
-
-```
-   ┌─────────────────┐
-   │ 1. Load         │  HuggingFace AutoModelForCausalLM
-   └────────┬────────┘
-            ▼
-   ┌─────────────────┐
-   │ 2. Recipe plan  │  Decide which layers become SSM
-   └────────┬────────┘
-            ▼
-   ┌─────────────────┐
-   │ 3. Surgery      │  State-dict manipulation
-   └────────┬────────┘
-            ▼
-   ┌─────────────────┐
-   │ 4. Distillation │  KL divergence training
-   └────────┬────────┘
-            ▼
-   ┌─────────────────┐
-   │ 5. Export       │  gguf-py → llama-quantize
-   └────────┬────────┘
-            ▼
-   ┌─────────────────┐
-   │ 6. Verify       │  Optional forward-pass check
-   └─────────────────┘
-```
-
-See [architecture.md on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/architecture.md)
-and the [design spec on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/superpowers/specs/2026-09-21-ssmforge-design.md)
-for the full design.
-
----
-
-## Supported models (v0.2.1)
-
-- **Llama** family — `meta-llama/Llama-3.1-*`, `meta-llama/Llama-3.2-*`, `TinyLlama/TinyLlama-*`
-- **Mistral** family — `mistralai/Mistral-7B-*`
-- **Qwen2** family — `Qwen/Qwen2-0.5B-Instruct` through `Qwen/Qwen2-72B-Instruct` (handles tied embeddings)
-- **Phi-3** family — `microsoft/Phi-3-mini-*` (handles fused qkv_proj + gate_up_proj)
-- **Gemma2** family — `google/gemma-2-*` (Llama-compatible layout)
-
-Adding new architectures: subclass `ArchitectureConverter`, register it. See
-[architecture.md on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/architecture.md).
-
-> **v0.2.x caveat:** Hybrid models are produced with random-init SSM weights.
-> Distillation is a 2-step stub. For meaningful output, you'd need real
-> distillation training (v0.3). For now, `ssmforge convert` exercises the
-> full pipeline end-to-end on any supported source model — useful for
-> development, not yet a production tool.
-
----
+Requires Python 3.10+. Pulls in `transformers` and `huggingface_hub` for
+loading HF models. See [INSTALL.md](docs/INSTALL.md) for details.
+
+## Why this exists
+
+When you do surgery on a HuggingFace model — convert it, fine-tune it,
+quantize it, port it to a different architecture family — the source
+model's quirks are usually what break things. Qwen2 silently drops
+attention biases. Phi-3 fuses QKV. Mistral uses sliding window. Mixtral
+is MoE. None of this is obvious from `config.model_type` alone.
+
+`ssmforge arch` looks at the actual weights and config, and tells you
+exactly which quirks your model has — before you spend an hour
+discovering them at inference time.
 
 ## License
 
-Apache 2.0. See [LICENSE](https://github.com/lordxmen2k/SSMForge/blob/main/LICENSE).
-
-## Links
-
-- **Repo:** https://github.com/lordxmen2k/SSMForge
-- **PyPI:** https://pypi.org/project/ssmforge/
-- **Issues:** https://github.com/lordxmen2k/SSMForge/issues
-- **Spec:** [design spec on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/superpowers/specs/2026-09-21-ssmforge-design.md)
-- **Plan:** [implementation plan on GitHub](https://github.com/lordxmen2k/SSMForge/blob/main/docs/superpowers/plans/2026-09-21-ssmforge-implementation.md)
+Apache 2.0
