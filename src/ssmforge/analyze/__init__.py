@@ -29,11 +29,15 @@ from ssmforge.analyze.state_dict_scan import (
     count_state_dict_summary,
 )
 from ssmforge.analyze.summary import render_summary
+from ssmforge.analyze.markdown_render import format_report_markdown
+from ssmforge.analyze.diff import diff_reports
 
 __all__ = [
     "build_report",
     "format_report_json",
+    "format_report_markdown",
     "render_summary",
+    "diff_reports",
     "QuirkReport",
     "scan_state_dict",
     "count_state_dict_summary",
