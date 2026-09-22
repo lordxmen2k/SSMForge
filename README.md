@@ -33,8 +33,46 @@ print(f"GGUF:     {result.gguf_path}")
 print(f"Manifest: {result.manifest_path}")
 ```
 
-The result loads in `llama.cpp`, `ollama`, `LM Studio`, `Jan`, and any other
-GGUF-compatible runtime.
+The result is a **hybrid SSM/attention** GGUF that loads via SSMForge's own
+self-contained runtime (`ssmforge run ...` in pure PyTorch) — see
+[Running the model](#running-the-model).
+
+> ⚠️ **Important: SSMForge GGUFs do NOT load in mainstream runtimes**
+> (yet). Stock `llama.cpp`, `ollama`, LM Studio, etc. don't implement the
+> SSM2 forward kernel so they'll reject the GGUF with errors like
+> `unknown model architecture: 'ssmforge'` or
+> `model created empty tensor graph`.
+>
+> **For inference today:** use `ssmforge run --model <gguf> --prompt "..."`
+> (built into this package, no external service needed). It's slower than
+> a C++ kernel would be but it works on any machine with PyTorch.
+>
+> **For inference in stock llama.cpp / ollama:** requires implementing the
+> SSM2 chunked SSD forward kernel — planned for v0.3.
+
+---
+
+## ⚠️ Experimental — Not for production
+
+**SSMForge is a research/experimental project. Do not use converted models
+in production environments.**
+
+What this means in practice:
+- Output weights are produced by a 2-step distillation stub; trained against
+  the teacher for ~2 batches only. Useful for **pipeline validation**,
+  not for serving to real users.
+- The forward graph in vendored llama.cpp is a stub (the SSM2 chunked SSD
+  kernel is v0.3 work). Inference is via `ssmforge run` in pure PyTorch,
+  slower than a C++ runtime would be.
+- Output quality has **not been measured**. The paper-style numbers in
+  the tables below say "TBD" because they don't exist yet.
+- No support agreements, no version promises, no migration paths.
+- Conversions may produce **worse** outputs than the teacher if the Mamba2
+  layers don't get meaningful training signal during distillation.
+
+If you want a working hybrid model today, use NVIDIA's published Mamba
+recipes in PyTorch directly. We're aiming for that level of quality in
+a future version.
 
 ---
 
@@ -487,11 +525,15 @@ ollama run my-hybrid-model
 
 ## Recipes
 
-| Recipe | SSM ratio | Best for |
-|--------|-----------|----------|
-| `hybrid-25` (default, production) | ~25% | Production deployments |
-| `hybrid-50` (production) | ~50% (1:1 alternation) | Aggressive long-context optimization |
-| `pure-mamba` (experimental, requires `--experimental`) | 100% | Edge deployment, ultra-long context research |
+**Reminder:** all recipes are experimental. "Best for" below is the
+recipe's intent; outcomes in production environments have **not** been
+verified.
+
+| Recipe | SSM ratio | Intent |
+|--------|-----------|--------|
+| `hybrid-25` (default) | ~25% | Conservative MambaInLlama-style mix; closest to the published paper |
+| `hybrid-50` | ~50% (1:1 alternation) | Aggressive long-context, no attention-only blocks |
+| `pure-mamba` (requires `--experimental`) | 100% | All-SSM, attention entirely replaced. Quality degradation expected. |
 
 All three preserve the original tokenizer and chat template.
 

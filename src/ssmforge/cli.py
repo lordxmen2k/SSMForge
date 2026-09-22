@@ -14,7 +14,13 @@ def main(argv: list[str] | None = None) -> None:
     """Entry point for the `ssmforge` command."""
     parser = argparse.ArgumentParser(
         prog="ssmforge",
-        description="Convert pretrained transformers to hybrid SSM/attention models.",
+        description=(
+            "Convert pretrained transformers to hybrid SSM/attention models.\n\n"
+            "WARNING: experimental. Output quality unverified. Not for production.\n"
+            "SSMForge GGUFs only load via `ssmforge run` (pure PyTorch) — they\n"
+            "do NOT load in ollama / LM Studio / stock llama.cpp (yet)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -39,15 +45,42 @@ def main(argv: list[str] | None = None) -> None:
 
     subparsers.add_parser("list-recipes", help="List registered recipes")
 
+    run_p = subparsers.add_parser(
+        "run",
+        help="Run inference on an SSMForge GGUF (self-contained, no ollama needed)",
+    )
+    run_p.add_argument("--model", required=True, help="Path to SSMForge GGUF")
+    run_p.add_argument("--prompt", default=None, help="Text prompt (omit for --interactive)")
+    run_p.add_argument("--interactive", action="store_true", help="REPL mode")
+    run_p.add_argument("--max-new-tokens", type=int, default=30)
+    run_p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    run_p.add_argument("--no-quiet", action="store_true", help="Print model metadata")
+
     args = parser.parse_args(argv)
 
-    try:
-        if args.command == "list-recipes":
-            print("Registered recipes:")
-            for name in list_recipes():
-                print(f"  - {name}")
-            sys.exit(0)
-        elif args.command == "convert":
+    if args.command == "list-recipes":
+        print("Registered recipes:")
+        for name in list_recipes():
+            print(f"  - {name}")
+        sys.exit(0)
+    elif args.command == "run":
+        from ssmforge.runtime.run import main as run_main
+        # Pass through only the args after "run"
+        run_argv = []
+        seen = False
+        for a in (argv or sys.argv[1:]):
+            if seen:
+                run_argv.append(a)
+            elif a == "run":
+                seen = True
+        sys.exit(run_main(run_argv))
+    elif args.command == "convert":
+        print(
+            "WARNING: experimental software. Output quality not verified. "
+            "Not for production environments.",
+            file=sys.stderr,
+        )
+        try:
             result = convert(
                 source=args.source,
                 recipe=args.recipe,
@@ -59,15 +92,15 @@ def main(argv: list[str] | None = None) -> None:
                 experimental=args.experimental,
                 no_distill=args.no_distill,
             )
-            print(f"GGUF: {result.gguf_path}")
-            print(f"Manifest: {result.manifest_path}")
-            print(f"Stats: {result.stats}")
-            sys.exit(0)
-    except SSMForgeError as e:
-        if args.debug:
-            raise
-        print(str(e), file=sys.stderr)
-        sys.exit(1)
+        except SSMForgeError as e:
+            if args.debug:
+                raise
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+        print(f"GGUF: {result.gguf_path}")
+        print(f"Manifest: {result.manifest_path}")
+        print(f"Stats: {result.stats}")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
