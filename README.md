@@ -97,7 +97,13 @@ SSMForge:
 6. Writes a manifest JSON with provenance (source SHA, recipe, layer mapping,
    output file SHA)
 
-**The pipeline is real and tested.** 70 unit + integration + property tests
+Plus a standalone architecture analyzer (`ssmforge arch`) that inspects any
+HuggingFace model and reports on architectural quirks that affect conversion:
+attention biases, fused QKV/gate-up projections, tied embeddings, MoE,
+grouped attention, and more. Useful as a pre-flight check before running
+`ssmforge convert`.
+
+**The pipeline is real and tested.** 144 unit + integration + property tests
 pass. The CLI works. A real GGUF file is produced and round-trips through
 `gguf-py`. The dry run works on a real HuggingFace model end-to-end.
 
@@ -394,7 +400,65 @@ Output:
 ./out/meta-llama_Llama-3.1-8B-Instruct.HYBRID-25.Q4_K_M.manifest.json
 ```
 
-### Example 2: Python API
+### Example 2: Inspect a model's architecture before converting
+
+`ssmforge arch` runs the architecture analyzer on a HuggingFace model and
+prints a JSON report on stdout (with a human-readable summary on stderr).
+Use this to check quirks (attention biases, fused QKV, MoE, etc.) before
+running a 30-minute conversion only to find out at inference time that
+something was silently dropped.
+
+```bash
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --output qwen2-report.json
+cat qwen2-report.json
+```
+
+Sample report (Qwen2-1.5B):
+
+```json
+{
+  "model_id": "Qwen/Qwen2-1.5B-Instruct",
+  "model_type": "qwen2",
+  "config": {
+    "vocab_size": 151936,
+    "hidden_size": 1536,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 12,
+    "num_key_value_heads": 2,
+    "intermediate_size": 8960,
+    "tie_word_embeddings": true,
+    "attention_bias": true
+  },
+  "quirks": {
+    "attention_bias": true,
+    "tied_embeddings": true,
+    "fused_qkv": false,
+    "fused_gate_up": false,
+    "grouped_attention": true,
+    "moe": false
+  },
+  "state_dict_summary": {
+    "total_tensors": 387,
+    "total_params": 1543714304
+  },
+  "compatibility": {
+    "is_compatible": true,
+    "issues": [
+      {
+        "severity": "info",
+        "quirk": "attention_bias",
+        "message": "Model has bias=True on attention q/k/v projections. ..."
+      }
+    ]
+  }
+}
+```
+
+The `compatibility` section flags issues BEFORE conversion runs. For example,
+MoE models exit with code 2 and a clear "MoE is not supported" message —
+no need to wait for conversion to fail.
+
+### Example 3: Python API
 
 ```python
 from pathlib import Path

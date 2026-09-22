@@ -1,6 +1,6 @@
 # Recipes
 
-SSMForge ships with three recipes. All preserve the original tokenizer and chat template.
+SSMForge ships with four recipes. All preserve the original tokenizer and chat template.
 
 ## hybrid-25 (production, default)
 
@@ -21,6 +21,14 @@ SSMForge ships with three recipes. All preserve the original tokenizer and chat 
 **Best for:** Aggressive long-context optimization, when you can afford the quality loss.
 
 **Reference:** [Jamba (AI21)](https://arxiv.org/abs/2403.19887)
+
+## pure-attention (diagnostic)
+
+**What it does:** Pass-through — keeps all layers as attention with no SSM substitution. The result is architecturally identical to the source transformer, just routed through our pipeline.
+
+**Quality:** Should match the source model exactly (any deviation indicates a pipeline bug, not a recipe limitation).
+
+**Best for:** Verifying the conversion pipeline is non-destructive. If `pure-attention` produces coherent output and `hybrid-25` doesn't, the gap is in distillation quality, not the conversion infrastructure. Use `ssmforge arch` first to confirm the source model has compatible quirks (attention biases, tied embeddings, fused QKV, etc.).
 
 ## pure-mamba (experimental)
 

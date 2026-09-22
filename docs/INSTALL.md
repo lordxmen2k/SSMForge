@@ -238,10 +238,14 @@ ssmforge list-recipes
 #   Registered recipes:
 #     - hybrid-25
 #     - hybrid-50
+#     - pure-attention
 #     - pure-mamba
 
 # Importable
 python -c "import ssmforge; print(ssmforge.__version__)"
+
+# Architecture analyzer (pre-flight check)
+ssmforge arch hf-internal-testing/tiny-random-LlamaForCausalLM
 
 # Real end-to-end dry run (downloads ~50MB HF model)
 ssmforge convert hf-internal-testing/tiny-random-LlamaForCausalLM --dry-run

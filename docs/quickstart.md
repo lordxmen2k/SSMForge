@@ -29,12 +29,20 @@ print(f"Stats: {result.stats}")
 ## CLI
 
 ```bash
+# Inspect a model's architecture (pre-flight check)
+ssmforge arch Qwen/Qwen2-1.5B-Instruct
+
+# Convert a HuggingFace model to a hybrid SSM/attention GGUF
 ssmforge convert meta-llama/Llama-3.2-1B \
     --recipe hybrid-25 \
     --quantize Q4_K_M \
     --output ./out
 
+# List registered recipes
 ssmforge list-recipes
+
+# Run inference on a converted GGUF (self-contained, no ollama needed)
+ssmforge run --model ./out/...Q4_K_M.gguf --prompt "Hello"
 ```
 
 For dry runs (plan + surgery only, no distillation or export):

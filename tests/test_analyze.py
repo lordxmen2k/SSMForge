@@ -1,0 +1,320 @@
+"""Tests for ssmforge arch — the architecture analyzer."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+import torch
+
+from ssmforge.analyze import (
+    build_report,
+    format_report_json,
+    scan_state_dict,
+    count_state_dict_summary,
+    render_summary,
+)
+from ssmforge.analyze.state_dict_scan import QuirkReport
+
+
+# ---------- Fixtures ----------
+
+def _fake_state_dict_qwen2(hidden=64, n_layers=2, inter=128, vocab=100, n_heads=4, n_kv_heads=2):
+    """Build a fake Qwen2-style state dict with biases and tied embeddings."""
+    head_dim = hidden // n_heads
+    kv_dim = head_dim * n_kv_heads
+    sd = {
+        "model.embed_tokens.weight": torch.randn(vocab, hidden),
+    }
+    for i in range(n_layers):
+        sd[f"model.layers.{i}.self_attn.q_proj.weight"] = torch.randn(hidden, hidden)
+        sd[f"model.layers.{i}.self_attn.q_proj.bias"] = torch.zeros(hidden)
+        sd[f"model.layers.{i}.self_attn.k_proj.weight"] = torch.randn(kv_dim, hidden)
+        sd[f"model.layers.{i}.self_attn.k_proj.bias"] = torch.zeros(kv_dim)
+        sd[f"model.layers.{i}.self_attn.v_proj.weight"] = torch.randn(kv_dim, hidden)
+        sd[f"model.layers.{i}.self_attn.v_proj.bias"] = torch.zeros(kv_dim)
+        sd[f"model.layers.{i}.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.randn(inter, hidden)
+        sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.randn(inter, hidden)
+        sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.randn(hidden, inter)
+        sd[f"model.layers.{i}.input_layernorm.weight"] = torch.ones(hidden)
+        sd[f"model.layers.{i}.post_attention_layernorm.weight"] = torch.ones(hidden)
+    sd["model.norm.weight"] = torch.ones(hidden)
+    # Tied: lm_head shares storage with embed_tokens
+    sd["lm_head.weight"] = sd["model.embed_tokens.weight"]
+    return sd
+
+
+def _fake_state_dict_llama(hidden=64, n_layers=2, inter=128, vocab=100, n_heads=4):
+    """Build a fake Llama-style state dict (no biases, separate lm_head, no grouped attention)."""
+    sd = {
+        "model.embed_tokens.weight": torch.randn(vocab, hidden),
+    }
+    for i in range(n_layers):
+        sd[f"model.layers.{i}.self_attn.q_proj.weight"] = torch.randn(hidden, hidden)
+        sd[f"model.layers.{i}.self_attn.k_proj.weight"] = torch.randn(hidden, hidden)
+        sd[f"model.layers.{i}.self_attn.v_proj.weight"] = torch.randn(hidden, hidden)
+        sd[f"model.layers.{i}.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.randn(inter, hidden)
+        sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.randn(inter, hidden)
+        sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.randn(hidden, inter)
+        sd[f"model.layers.{i}.input_layernorm.weight"] = torch.ones(hidden)
+        sd[f"model.layers.{i}.post_attention_layernorm.weight"] = torch.ones(hidden)
+    sd["model.norm.weight"] = torch.ones(hidden)
+    sd["lm_head.weight"] = torch.randn(vocab, hidden)  # separate, not tied
+    return sd
+
+
+def _fake_state_dict_phi3(hidden=64, n_layers=2, inter=128, vocab=100):
+    """Phi-3 style: fused QKV + fused gate_up, no biases."""
+    sd = {
+        "model.embed_tokens.weight": torch.randn(vocab, hidden),
+    }
+    for i in range(n_layers):
+        # Phi-3 has fused qkv_proj with shape (q_dim + 2*kv_dim, hidden)
+        # Simplified: just use a single fused weight
+        sd[f"model.layers.{i}.self_attn.qkv_proj.weight"] = torch.randn(hidden * 3, hidden)
+        sd[f"model.layers.{i}.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        # Phi-3 fused gate_up_proj
+        sd[f"model.layers.{i}.mlp.gate_up_proj.weight"] = torch.randn(inter * 2, hidden)
+        sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.randn(hidden, inter)
+        sd[f"model.layers.{i}.input_layernorm.weight"] = torch.ones(hidden)
+        sd[f"model.layers.{i}.post_attention_layernorm.weight"] = torch.ones(hidden)
+    sd["model.norm.weight"] = torch.ones(hidden)
+    sd["lm_head.weight"] = torch.randn(vocab, hidden)
+    return sd
+
+
+def _fake_config(hidden=64, n_layers=2, inter=128, vocab=100, n_heads=4, n_kv_heads=None):
+    return SimpleNamespace(
+        model_type="test",
+        architectures=["TestForCausalLM"],
+        vocab_size=vocab,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        num_hidden_layers=n_layers,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads or n_heads,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
+        attention_bias=False,
+        torch_dtype=torch.float32,
+    )
+
+
+# ---------- scan_state_dict ----------
+
+def test_scan_detects_attention_bias():
+    sd = _fake_state_dict_qwen2()
+    report = scan_state_dict(sd)
+    assert report.attention_bias is True
+    assert any("q_proj.bias" in k for k in report.bias_keys_found)
+
+
+def test_scan_no_bias_for_llama_style():
+    sd = _fake_state_dict_llama()
+    report = scan_state_dict(sd)
+    assert report.attention_bias is False
+    assert report.bias_keys_found == []
+
+
+def test_scan_detects_tied_embeddings():
+    sd = _fake_state_dict_qwen2()
+    report = scan_state_dict(sd)
+    assert report.tied_embeddings is True
+
+
+def test_scan_no_tied_when_separate():
+    sd = _fake_state_dict_llama()
+    report = scan_state_dict(sd)
+    assert report.tied_embeddings is False
+
+
+def test_scan_detects_fused_qkv():
+    sd = _fake_state_dict_phi3()
+    report = scan_state_dict(sd)
+    assert report.fused_qkv is True
+    assert any("qkv_proj" in k for k in report.fused_keys_found)
+
+
+def test_scan_detects_fused_gate_up():
+    sd = _fake_state_dict_phi3()
+    report = scan_state_dict(sd)
+    assert report.fused_gate_up is True
+
+
+def test_scan_no_fused_for_standard():
+    sd = _fake_state_dict_llama()
+    report = scan_state_dict(sd)
+    assert report.fused_qkv is False
+    assert report.fused_gate_up is False
+
+
+def test_scan_detects_grouped_attention():
+    sd = _fake_state_dict_qwen2(n_kv_heads=2)
+    report = scan_state_dict(sd)
+    assert report.grouped_attention is True
+
+
+def test_scan_no_grouped_for_dense():
+    sd = _fake_state_dict_llama()  # n_heads == n_kv_heads
+    report = scan_state_dict(sd)
+    assert report.grouped_attention is False
+
+
+def test_scan_handles_empty_state_dict():
+    report = scan_state_dict({})
+    assert isinstance(report, QuirkReport)
+    assert report.attention_bias is False
+
+
+def test_scan_handles_missing_lm_head():
+    """If lm_head.weight is missing, treat as tied embeddings."""
+    sd = _fake_state_dict_llama()
+    del sd["lm_head.weight"]
+    report = scan_state_dict(sd)
+    assert report.tied_embeddings is True
+
+
+def test_scan_detects_moe():
+    """MoE models have expert tensors — should be detected."""
+    sd = _fake_state_dict_llama()
+    # Add MoE-style tensors
+    sd["model.layers.0.block_sparse_moe.gate.weight"] = torch.randn(8, 64)
+    sd["model.layers.0.block_sparse_moe.experts.0.w1.weight"] = torch.randn(128, 64)
+    sd["model.layers.0.block_sparse_moe.experts.0.w2.weight"] = torch.randn(64, 128)
+    report = scan_state_dict(sd)
+    assert report.moe is True
+
+
+def test_scan_handles_numpy_arrays():
+    """Some state dicts come back as numpy (e.g. via gguf-py). Should not crash."""
+    sd = _fake_state_dict_llama()
+    sd_np = {k: v.numpy() if isinstance(v, torch.Tensor) else v for k, v in sd.items()}
+    report = scan_state_dict(sd_np)
+    assert report.attention_bias is False
+    assert report.tied_embeddings is False
+
+
+# ---------- count_state_dict_summary ----------
+
+def test_count_summary_basic():
+    sd = _fake_state_dict_llama()
+    summary = count_state_dict_summary(sd)
+    assert summary["total_tensors"] == len(sd)
+    assert summary["total_params"] > 0
+    assert summary["tensor_breakdown"]["embeddings"] == 1
+    assert summary["tensor_breakdown"]["attention_weights"] == 4 * 2  # 4 per layer * 2 layers
+    assert summary["tensor_breakdown"]["mlp_weights"] == 3 * 2
+    assert summary["tensor_breakdown"]["layer_norms"] == 2 * 2
+    assert summary["tensor_breakdown"]["final_norm"] == 1
+    assert summary["tensor_breakdown"]["lm_head"] == 1
+
+
+def test_count_summary_handles_numpy():
+    sd = _fake_state_dict_llama()
+    sd_np = {k: v.numpy() if isinstance(v, torch.Tensor) else v for k, v in sd.items()}
+    summary = count_state_dict_summary(sd_np)
+    # numpy arrays have .size attribute
+    assert summary["total_params"] > 0
+
+
+def test_count_summary_counts_biases():
+    sd = _fake_state_dict_qwen2()
+    summary = count_state_dict_summary(sd)
+    assert summary["tensor_breakdown"]["attention_biases"] == 3 * 2  # q/k/v per layer
+
+
+# ---------- build_report ----------
+
+def test_build_report_qwen2():
+    sd = _fake_state_dict_qwen2(n_layers=2)
+    cfg = _fake_config(n_layers=2, n_kv_heads=2)
+    report = build_report(
+        model_id="Qwen/Qwen2-test",
+        config=cfg,
+        state_dict=sd,
+    )
+    assert report["model_id"] == "Qwen/Qwen2-test"
+    assert report["model_type"] == "test"
+    assert report["quirks"]["attention_bias"] is True
+    assert report["quirks"]["tied_embeddings"] is True
+    assert report["quirks"]["grouped_attention"] is True
+    assert report["compatibility"] is not None
+    assert report["compatibility"]["is_compatible"] is True
+
+
+def test_build_report_llama_no_quirks():
+    sd = _fake_state_dict_llama()
+    cfg = _fake_config()
+    report = build_report("test/llama", cfg, sd)
+    assert report["quirks"]["attention_bias"] is False
+    assert report["quirks"]["tied_embeddings"] is False
+    assert report["quirks"]["grouped_attention"] is False
+
+
+def test_build_report_moe_is_incompatible():
+    sd = _fake_state_dict_llama()
+    sd["model.layers.0.block_sparse_moe.experts.0.w1.weight"] = torch.randn(128, 64)
+    cfg = _fake_config()
+    report = build_report("test/moe", cfg, sd)
+    assert report["quirks"]["moe"] is True
+    assert report["compatibility"]["is_compatible"] is False
+    issues = report["compatibility"]["issues"]
+    assert any("moe" in i["quirk"].lower() for i in issues)
+
+
+def test_build_report_uses_cfg_defaults():
+    """Missing config fields should default, not crash."""
+    cfg = SimpleNamespace(
+        model_type="custom",
+        vocab_size=100,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=128,
+        # missing: num_key_value_heads, rope_theta, rms_norm_eps, etc.
+    )
+    sd = _fake_state_dict_llama()
+    report = build_report("test/custom", cfg, sd)
+    assert report["config"]["max_position_embeddings"] is None  # missing → None
+
+
+def test_build_report_json_serializable():
+    sd = _fake_state_dict_llama()
+    cfg = _fake_config()
+    report = build_report("test", cfg, sd)
+    json_text = format_report_json(report)
+    parsed = json.loads(json_text)
+    assert parsed["model_id"] == "test"
+    assert "quirks" in parsed
+
+
+def test_render_summary_contains_key_fields():
+    sd = _fake_state_dict_qwen2()
+    cfg = _fake_config(n_kv_heads=2)
+    report = build_report("test", cfg, sd)
+    summary = render_summary(report)
+    assert "test" in summary
+    assert "Qwen" in summary or "model_type" in summary
+    assert "attention_bias" in summary
+    assert "tied_embeddings" in summary
+    assert "grouped_attention" in summary
+
+
+def test_compatibility_notes_have_required_fields():
+    """Every issue must have severity, quirk, message."""
+    sd = _fake_state_dict_llama()
+    sd["model.layers.0.block_sparse_moe.experts.0.w1.weight"] = torch.randn(128, 64)
+    cfg = _fake_config()
+    report = build_report("test", cfg, sd)
+    for issue in report["compatibility"]["issues"]:
+        assert "severity" in issue
+        assert "quirk" in issue
+        assert "message" in issue
+        assert issue["severity"] in ("info", "warning", "error")
