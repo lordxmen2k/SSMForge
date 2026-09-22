@@ -5,9 +5,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from types import SimpleNamespace
 
 from ssmforge.export.gguf_writer import write_f16_gguf
 from ssmforge.runtime.loader import load_hybrid_model_from_gguf
+from gguf import GGUFReader
 
 
 def _build_minimal_hybrid_state_dict(hidden: int = 256, n_layers: int = 4, inter: int = 1024, vocab: int = 100):
@@ -154,3 +156,76 @@ def test_loader_handles_default_ssm_hparams(tmp_path):
     assert model.config.ssm_d_conv == 4
     assert model.config.ssm_d_state == 128
     assert model.config.ssm_dt_rank == 64
+
+
+def test_loader_loads_qwen2_style_shapes_clean(tmp_path):
+    """Regression: loader must handle gguf-py's metadata-vs-data shape mismatch.
+
+    gguf.Writer.add_tensor records shape in llama.cpp convention
+    ([in_features, out_features] for Linear, [hidden, vocab] for embeddings)
+    but t.data returns the array in PyTorch-native byte order. The loader
+    must use t.data.shape (PyTorch order) and ignore the metadata shape.
+
+    This simulates the Qwen2-1.5B case (hidden=1536, intermediate=8960,
+    vocab=151936, head_dim=128, kv_heads=2) at small scale.
+    """
+    hidden, n_layers, inter, vocab, n_heads, n_kv_heads = 64, 2, 256, 1000, 4, 2
+    head_dim = hidden // n_heads  # 16
+
+    sd = {
+        "model.embed_tokens.weight": torch.arange(vocab * hidden, dtype=torch.float32).reshape(vocab, hidden),
+        "model.norm.weight": torch.ones(hidden),
+        "lm_head.weight": torch.zeros(vocab, hidden),  # tied embeddings — zero is fine, test only checks shape match
+    }
+    for i in range(n_layers):
+        sd[f"model.layers.{i}.self_attn.q_proj.weight"] = torch.zeros(hidden, hidden)
+        sd[f"model.layers.{i}.self_attn.k_proj.weight"] = torch.zeros(head_dim * n_kv_heads, hidden)
+        sd[f"model.layers.{i}.self_attn.v_proj.weight"] = torch.zeros(head_dim * n_kv_heads, hidden)
+        sd[f"model.layers.{i}.self_attn.o_proj.weight"] = torch.zeros(hidden, hidden)
+        sd[f"model.layers.{i}.mlp.gate_proj.weight"] = torch.zeros(inter, hidden)
+        sd[f"model.layers.{i}.mlp.up_proj.weight"] = torch.zeros(inter, hidden)
+        sd[f"model.layers.{i}.mlp.down_proj.weight"] = torch.zeros(hidden, inter)
+        sd[f"model.layers.{i}.input_layernorm.weight"] = torch.ones(hidden)
+        sd[f"model.layers.{i}.post_attention_layernorm.weight"] = torch.ones(hidden)
+
+    cfg = SimpleNamespace(
+        name_or_path="test",
+        max_position_embeddings=2048,
+        hidden_size=hidden,
+        num_hidden_layers=n_layers,
+        intermediate_size=inter,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-5,
+        vocab_size=vocab,
+    )
+
+    f16_path = tmp_path / "qwen2_style.f16.gguf"
+    write_f16_gguf(sd, cfg, tokenizer=None, output_path=f16_path)
+
+    # Verify the gguf-py shape-vs-data mismatch exists in the file we just wrote.
+    # (We expect this — it's how llama.cpp / gguf-py works.)
+    reader = GGUFReader(str(f16_path), mode="r")
+    for t in reader.tensors:
+        if "embed_tokens" in t.name:
+            data_shape = tuple(int(s) for s in t.data.shape)
+            meta_shape = tuple(int(s) for s in t.shape)
+            # t.data should be PyTorch order (vocab, hidden); metadata reversed
+            assert data_shape == (vocab, hidden), f"data shape {data_shape}"
+            assert meta_shape == (hidden, vocab), f"meta shape {meta_shape}"
+            break
+
+    # The loader should now load WITHOUT size-mismatch errors even though
+    # the metadata shape is transposed relative to PyTorch expectations.
+    model, _ = load_hybrid_model_from_gguf(f16_path)
+    assert model is not None
+
+    # Confirm vocab size inferred correctly
+    assert model.config.vocab_size == vocab
+
+    # Forward pass on a Qwen2-shaped input
+    input_ids = torch.randint(0, vocab, (1, 8))
+    out = model(input_ids=input_ids)
+    assert out.logits.shape == (1, 8, vocab)
+    assert torch.isfinite(out.logits).all()
