@@ -22,11 +22,14 @@ Usage:
     ssmforge arch ./local/model --quiet
 """
 
-from ssmforge.analyze.report import build_report, format_report_json
+from ssmforge.analyze.report import build_report, build_report_from_config, format_report_json
 from ssmforge.analyze.state_dict_scan import (
     QuirkReport,
     scan_state_dict,
+    scan_config_only,
     count_state_dict_summary,
+    estimate_params_from_config,
+    estimate_memory_bytes,
 )
 from ssmforge.analyze.summary import render_summary
 from ssmforge.analyze.markdown_render import format_report_markdown
@@ -34,11 +37,15 @@ from ssmforge.analyze.diff import diff_reports
 
 __all__ = [
     "build_report",
+    "build_report_from_config",
     "format_report_json",
     "format_report_markdown",
     "render_summary",
     "diff_reports",
     "QuirkReport",
     "scan_state_dict",
+    "scan_config_only",
     "count_state_dict_summary",
+    "estimate_params_from_config",
+    "estimate_memory_bytes",
 ]

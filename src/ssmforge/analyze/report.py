@@ -21,6 +21,9 @@ from ssmforge.analyze.state_dict_scan import (
     QuirkReport,
     scan_state_dict,
     count_state_dict_summary,
+    scan_config_only,
+    estimate_params_from_config,
+    estimate_memory_bytes,
 )
 
 
@@ -298,6 +301,106 @@ def build_report(
         },
         "quirks": quirks.to_dict(),
         "state_dict_summary": summary,
+        "compatibility": {
+            "issues": [asdict(n) for n in notes],
+            "is_compatible": all(n.severity != "error" for n in notes),
+            "blockers": [n.quirk for n in notes if n.severity == "error"],
+            "warnings": [n.quirk for n in notes if n.severity == "warning"],
+        },
+        "profile": _build_profile(quirks, cfg, model_id),
+    }
+
+    return report
+
+
+def build_report_from_config(
+    model_id: str,
+    config: Any,
+) -> dict:
+    """Build a partial architecture report from the config alone.
+
+    Used by `ssmforge arch MODEL --dry-run` to preview what quirks the model
+    has without loading weights. Useful for:
+    - Sanity-checking an unfamiliar model before committing to a multi-GB
+      download
+    - Pre-flight memory estimate
+    - Quickly comparing configs of multiple models
+
+    Returns a report dict in the same shape as `build_report` but with:
+    - `state_dict_summary` showing zeros (no weights loaded)
+    - A `dry_run` flag set to True
+    - A `memory_estimate` field with rough byte / human-formatted size
+    - Quirks that need state_dict inspection will be marked as 'unknown'
+      or False (we don't lie about what we can verify)
+    """
+    quirks = scan_config_only(config)
+    notes = build_compatibility_notes(quirks)
+
+    def cfg(name, default=None):
+        return getattr(config, name, default)
+
+    # Cross-check config.attention_bias against... nothing (no state_dict)
+    config_says = getattr(config, "attention_bias", None) if config else None
+    reported_attention_bias = (
+        bool(config_says) if config_says is not None else False
+    )
+
+    # Resolve rope_theta for reporting
+    rope_theta_value, rope_theta_source = _format_rope_theta(config, quirks)
+
+    # Estimate parameters and memory
+    estimated_params = estimate_params_from_config(config)
+    dtype_str = str(cfg("torch_dtype", "float32"))
+    # Normalize dtype names
+    if "bfloat16" in dtype_str or "bf16" in dtype_str.lower():
+        bytes_per = 2
+        dtype_label = "bfloat16"
+    elif "float16" in dtype_str or "fp16" in dtype_str.lower() or "half" in dtype_str.lower():
+        bytes_per = 2
+        dtype_label = "float16"
+    elif "float32" in dtype_str or "fp32" in dtype_str.lower():
+        bytes_per = 4
+        dtype_label = "float32"
+    else:
+        bytes_per = 2
+        dtype_label = "bfloat16"
+    estimated_bytes = int(estimated_params * bytes_per)
+
+    # Build the partial report
+    report = {
+        "model_id": model_id,
+        "model_type": cfg("model_type", "unknown"),
+        "architectures": cfg("architectures", []),
+        "dry_run": True,
+        "config": {
+            "vocab_size": cfg("vocab_size"),
+            "hidden_size": cfg("hidden_size"),
+            "intermediate_size": cfg("intermediate_size"),
+            "num_hidden_layers": cfg("num_hidden_layers"),
+            "num_attention_heads": cfg("num_attention_heads"),
+            "num_key_value_heads": cfg("num_key_value_heads", cfg("num_attention_heads")),
+            "max_position_embeddings": cfg("max_position_embeddings"),
+            "rope_theta": rope_theta_value,
+            "rope_theta_source": rope_theta_source,
+            "rope_scaling_type": quirks.rope_scaling_type,
+            "rms_norm_eps": cfg("rms_norm_eps"),
+            "tie_word_embeddings": cfg("tie_word_embeddings", False),
+            "attention_bias": reported_attention_bias,
+            "torch_dtype": str(cfg("torch_dtype", "unknown")),
+        },
+        "quirks": quirks.to_dict(),
+        "state_dict_summary": {
+            "total_tensors": 0,
+            "total_params": 0,
+            "tensor_breakdown": {},
+            "param_breakdown": {},
+            "note": "state_dict not loaded (dry-run mode)",
+        },
+        "memory_estimate": {
+            "estimated_params": estimated_params,
+            "estimated_bytes": estimated_bytes,
+            "dtype": dtype_label,
+        },
         "compatibility": {
             "issues": [asdict(n) for n in notes],
             "is_compatible": all(n.severity != "error" for n in notes),

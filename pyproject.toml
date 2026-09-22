@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssmforge"
-version = "0.1.4"
+version = "0.1.5"
 description = "Standalone HF architecture analyzer (`ssmforge arch`). Inspects any HuggingFace model and reports architectural quirks — attention biases, fused QKV/gate-up, tied embeddings, GQA, MQA, MoE, sliding window, LayerScale, soft-capping, partial RoPE, MLP type, norm type. Outputs structured JSON + human-readable summary."
 readme = "README.md"
 license = "Apache-2.0"

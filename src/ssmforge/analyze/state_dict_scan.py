@@ -428,3 +428,150 @@ def count_state_dict_summary(state_dict: dict) -> dict:
         summary["total_params"] += param_count
 
     return summary
+
+
+def scan_config_only(config: Any) -> QuirkReport:
+    """Scan an HF config for quirks WITHOUT loading model weights.
+
+    Useful for `ssmforge arch MODEL --dry-run` where you want to see what
+    the architecture looks like before committing to a multi-GB download.
+    Only detects quirks that come from the config (or config-derived fields
+    like num_key_value_heads). State-dict-derived quirks (tied_embeddings,
+    fused_qkv, attention_bias from actual bias tensors, layer_scale) will
+    be reported as 'unknown' or False with a note that they need a full
+    load to verify.
+    """
+    report = QuirkReport()
+
+    if config is None:
+        return report
+
+    # GQA / MQA from config
+    n_heads = getattr(config, "num_attention_heads", None)
+    n_kv_heads = getattr(config, "num_key_value_heads", None) or n_heads
+    if n_heads is not None and n_kv_heads is not None:
+        if n_kv_heads < n_heads:
+            report.grouped_attention = True
+        if n_kv_heads == 1 and n_heads > 1:
+            report.mqa = True
+
+    # MoE from config
+    n_experts = getattr(config, "num_local_experts", None) or getattr(config, "num_experts", None)
+    if n_experts is not None and int(n_experts) > 1:
+        report.moe = True
+        report.num_experts = int(n_experts)
+        top_k = getattr(config, "num_experts_per_tok", None) or getattr(config, "moe_top_k", None)
+        if top_k is not None:
+            report.moe_top_k = int(top_k)
+
+    # Sliding window from config
+    sliding_window = getattr(config, "sliding_window", None)
+    if sliding_window is not None and int(sliding_window) > 0:
+        report.sliding_window = int(sliding_window)
+
+    # Soft-capping from config
+    attn_cap = getattr(config, "attn_logit_softcapping", None)
+    final_cap = getattr(config, "final_logit_softcapping", None)
+    if attn_cap is not None or final_cap is not None:
+        caps = {}
+        if attn_cap is not None:
+            caps["attn_logit_softcapping"] = float(attn_cap)
+        if final_cap is not None:
+            caps["final_logit_softcapping"] = float(final_cap)
+        report.soft_capping = caps
+
+    # Partial RoPE from config
+    rope_factor = getattr(config, "partial_rotary_factor", None)
+    if rope_factor is not None and float(rope_factor) < 1.0:
+        report.partial_rope_factor = float(rope_factor)
+
+    # RoPE theta + scaling type from config
+    rope_theta, _ = _resolve_rope_theta_from_config(config)
+    report.rope_theta = rope_theta
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        report.rope_scaling_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+
+    return report
+
+
+def estimate_params_from_config(config: Any) -> int:
+    """Estimate total parameter count from config alone (no weights loaded).
+
+    Uses the standard transformer param count formula:
+    - Embeddings: vocab_size * hidden_size (often tied to lm_head)
+    - Per-layer:
+      - Self-attn: (hidden * hidden) for Q + (n_kv_heads * head_dim * hidden) for K + same for V + (hidden * hidden) for O
+      - MLP: depends on type (SwiGLU/GeGLU = 3 * hidden * intermediate; GeLU = 2 * hidden * intermediate)
+      - 2 layer norms: ~2 * hidden
+    - Final norm: hidden
+
+    This is a rough estimate. Real param count may differ by ~5% due to biases.
+    """
+    if config is None:
+        return 0
+
+    vocab = getattr(config, "vocab_size", 0) or 0
+    hidden = getattr(config, "hidden_size", 0) or 0
+    intermediate = getattr(config, "intermediate_size", 0) or 0
+    n_layers = getattr(config, "num_hidden_layers", 0) or 0
+    n_heads = getattr(config, "num_attention_heads", 1) or 1
+    n_kv_heads = getattr(config, "num_key_value_heads", n_heads) or n_heads
+
+    if not (vocab and hidden and intermediate and n_layers):
+        return 0
+
+    head_dim = hidden // n_heads if n_heads > 0 else 0
+
+    # Per-layer attention: Q (hidden*hidden), K (kv*hidden), V (kv*hidden), O (hidden*hidden)
+    # Approximated as hidden*hidden * 2 + n_kv_heads * head_dim * hidden * 2
+    attn_params = (
+        hidden * hidden * 2  # Q + O
+        + n_kv_heads * head_dim * hidden * 2  # K + V
+    )
+
+    # Per-layer MLP: SwiGLU/GeGLU has 3 matrices (gate, up, down), GeLU has 2 (fc_in, fc_out)
+    # Most modern LLMs use SwiGLU; for the estimate assume SwiGLU unless we know otherwise
+    hidden_act = getattr(config, "hidden_act", None) or getattr(config, "hidden_activation", None)
+    if hidden_act in ("gelu", "gelu_new", "gelu_pytorch_tanh"):
+        # GeLU MLP (2 matrices)
+        mlp_params = hidden * intermediate * 2
+    else:
+        # SwiGLU / GeGLU (3 matrices)
+        mlp_params = hidden * intermediate * 3
+
+    # Per-layer norms: ~2 * hidden
+    norm_params = 2 * hidden
+
+    # Per-layer total
+    per_layer = attn_params + mlp_params + norm_params
+
+    # Embeddings (count once even if tied)
+    embed_params = vocab * hidden
+    final_norm_params = hidden
+
+    total = embed_params + per_layer * n_layers + final_norm_params
+
+    # Add lm_head if not tied
+    if not getattr(config, "tie_word_embeddings", False):
+        total += embed_params
+
+    return int(total)
+
+
+def estimate_memory_bytes(params: int, dtype: str = "float16") -> int:
+    """Estimate memory required to load weights in bytes.
+
+    dtype can be: 'float32' (4 bytes), 'float16' (2), 'bfloat16' (2),
+    'int8' (1), 'int4' (0.5).
+    """
+    bytes_per = {
+        "float32": 4,
+        "float16": 2,
+        "bfloat16": 2,
+        "int8": 1,
+        "int4": 0.5,
+    }.get(dtype, 2)
+
+    return int(params * bytes_per)
+

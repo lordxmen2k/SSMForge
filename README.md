@@ -311,10 +311,11 @@ ssmforge arch <model_id_or_path> [options]
 
 | Flag | Short | Purpose | Default |
 |------|-------|---------|---------|
-| `--output PATH` | `-o` | Write report to this file instead of stdout | stdout |
+| `--output PATH` | `-o` | Write report to this file (use `-` for stdout) | stdout |
 | `--format {json,markdown,md}` | `-f` | Output format | `json` |
 | `--quiet` | | Don't print the human-readable summary to stderr; print only the report | stderr summary on |
 | `--diff OTHER_MODEL` | | Compare against another model; prints a diff instead of a single report | none |
+| `--dry-run` | | Fetch only the config (no weight download); reports config-only quirks + memory estimate | full load |
 
 **Examples:**
 
@@ -341,6 +342,57 @@ ssmforge arch /path/to/local/model --output local-report.json
 # Skip summary (only print JSON)
 ssmforge arch mistralai/Mistral-7B-v0.1 --quiet
 ```
+
+### Pre-flight check (no weight download)
+
+```bash
+# Fetch only the config — no GBs of weights
+ssmforge arch mistralai/Mixtral-8x7B-v0.1 --dry-run
+```
+
+Output:
+
+```
+SSMForge arch DRY-RUN: mistralai/Mixtral-8x7B-v0.1
+  family:              Mixtral (MoE Llama)
+  attention_type:      GQA
+
+Model config:
+  model_type:          mixtral
+  hidden_size:         4096
+  num_hidden_layers:   32
+  num_attention_heads: 32
+  num_kv_heads:        8
+  ...
+  torch_dtype:         torch.bfloat16
+
+Memory estimate: ~13.49 GB in bfloat16 (7.24B params)
+
+Detected quirks (config-only):
+  ✓ GQA
+  ✓ MoE (num_experts=8, top_k=2)
+  ✓ rope_theta=1000000.0 (from config.rope_parameters.rope_theta)
+
+Quirks requiring --no-dry-run (state_dict inspection):
+  · attention_bias (config truth vs state_dict truth)
+  · tied_embeddings (lm_head tensor identity)
+  · fused_qkv (qkv_proj vs q/k/v split)
+  · fused_gate_up (gate_up_proj vs gate/up split)
+  · mlp_type / norm_type (state_dict structure)
+  · layer_scale (ls1/ls2 keys)
+
+Compatibility: BLOCKED by: moe
+```
+
+Useful for:
+- Pre-flight memory check before committing to a multi-GB download
+- Quickly checking if a model is MoE (which currently blocks compatibility)
+- Comparing configs of many models without filling the cache
+- Using `--dry-run --diff` for a config-only diff (no weight downloads on either side)
+
+Note: quirks that need actual tensor inspection (tied_embeddings, fused_qkv,
+attention_bias, mlp_type, norm_type, layer_scale) are NOT verified in
+dry-run mode. The output explicitly lists which quirks require a full load.
 
 ### `ssmforge --help`
 
