@@ -7,6 +7,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# Local bundles / archives
+ssmforge-*-bundle/
+ssmforge-*.zip
+ssmforge-*.tar.gz
+ssmforge-*.whl
+
 # Virtual envs
 venv/
 .venv/
