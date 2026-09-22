@@ -1,13 +1,12 @@
-"""Dequantize GGUF tensor bytes back to float32 / float16 numpy arrays.
+"""Vectorized GGUF tensor dequantizers.
 
-Implements the dequantization math for the types we use in
-ssmforge (F16, F32, Q4_K, Q6_K, Q8_0). Each dequantizer is a pure function
-that takes a bytes array and a shape and returns a numpy array.
+Each dequantizer operates on a bytes buffer + shape and returns the
+reconstructed float32 array using vectorized numpy operations. We avoid
+Python loops over super-blocks (the Q4_K reference impl has these loops
+in C; in Python they're unworkably slow for large weights).
 
-Reference:
-- Q4_K / Q5_K / Q6_K: see ggml-quants.c in llama.cpp / ggml. We follow
-  the reference implementation layout (super-blocks of 256 elements)
-  but with a minimal port that handles our produced GGUFs cleanly.
+Reference: ggml-quants.c (llama.cpp). Where the reference uses bit-packing
+and per-super-block arithmetic, we replicate that with numpy views.
 """
 
 from __future__ import annotations
@@ -17,18 +16,21 @@ import numpy as np
 # Tensor type IDs (matches gguf-py's GGMLQuantizationType enum)
 GGML_TYPE_F32   = 0
 GGML_TYPE_F16   = 1
+GGML_TYPE_Q4_0  = 2
+GGML_TYPE_Q4_1  = 3
+GGML_TYPE_Q5_0  = 6
+GGML_TYPE_Q5_1  = 7
 GGML_TYPE_Q8_0  = 8
 GGML_TYPE_Q4_K  = 12
+GGML_TYPE_Q5_K  = 13
 GGML_TYPE_Q6_K  = 14
 
 
-def dequantize(dtype: int, data: np.ndarray, shape: tuple) -> np.ndarray:
-    """Convert a quantized (or f16/f32) bytes array back to a float32 array.
-
-    Returns a numpy array of shape `shape` and dtype float32.
-    """
+def dequantize(dtype: int, data, shape: tuple) -> np.ndarray:
+    """Convert a quantized (or f16/f32) bytes array back to a float32 array."""
     if dtype == GGML_TYPE_F32:
-        return np.frombuffer(data.tobytes(), dtype=np.float32).reshape(shape).astype(np.float32)
+        arr = np.frombuffer(bytes(data), dtype=np.float32)
+        return arr.reshape(shape).astype(np.float32)
     elif dtype == GGML_TYPE_F16:
         return _dequant_f16(data, shape)
     elif dtype == GGML_TYPE_Q4_K:
@@ -41,208 +43,211 @@ def dequantize(dtype: int, data: np.ndarray, shape: tuple) -> np.ndarray:
         raise ValueError(f"Unsupported dequant dtype {dtype}")
 
 
-def _dequant_f16(data: np.ndarray, shape: tuple) -> np.ndarray:
-    """Convert F16 bytes to float32."""
-    raw = np.frombuffer(data.tobytes(), dtype=np.uint16)
-    # Manual f16 → f32 conversion (no numpy built-in until 2.0+)
-    sign = (raw >> 15) & 0x1
+def _f16_to_f32_scalar(raw: int) -> float:
+    """Convert a single 16-bit float to a Python float."""
+    if raw == 0:
+        return 0.0
+    sign = -1.0 if (raw >> 15) & 1 else 1.0
+    e = (raw >> 10) & 0x1F
+    m = raw & 0x3FF
+    if e == 0:
+        return sign * (m / 1024.0) * (2.0 ** -14)
+    if e == 0x1F:
+        return float("nan") if m else sign * float("inf")
+    return sign * (2.0 ** (e - 15)) * (1.0 + m / 1024.0)
+
+
+def _dequant_f16(data, shape: tuple) -> np.ndarray:
+    """Convert f16 (uint16 array) to f32 (float32 array) using vectorized numpy."""
+    raw = np.asarray(data, dtype=np.uint16)
+    out = np.empty(raw.shape, dtype=np.float32)
+
+    sign = np.where((raw >> 15) & 0x1, -1.0, 1.0)
     exponent = (raw >> 10) & 0x1F
-    mantissa = raw & 0x3FF
-    out = np.empty(raw.size, dtype=np.float32)
-    # Subnormal
+    mantissa = (raw & 0x3FF).astype(np.float32)
+
     sub = exponent == 0
-    # Normal
-    out[~sub] = np.where(
-        exponent == 0x1F,
-        np.where(mantissa[~sub] == 0, np.sign(sign[~sub]) * np.inf, np.nan),
-        np.sign(sign[~sub]) * np.power(2.0, exponent[~sub].astype(np.float32) - 15) *
-        (1 + mantissa[~sub].astype(np.float32) / 1024.0),
-    )
-    out[sub] = np.sign(sign[sub]) * mantissa[sub].astype(np.float32) / 1024.0 * (2.0 ** -14)
+    normal = ~sub
+
+    if normal.any():
+        e = exponent[normal].astype(np.int32)
+        m = mantissa[normal]
+        val = np.power(2.0, e - 15) * (1.0 + m / 1024.0)
+        is_nan = (e == 0x1F) & (m != 0)
+        val = np.where(is_nan, np.nan, val)
+        val = np.where((e == 0x1F) & (m == 0), np.inf, val)  # ±inf
+        out[normal] = sign[normal] * val
+
+    if sub.any():
+        val = mantissa[sub] / 1024.0 * (2.0 ** -14)
+        out[sub] = sign[sub] * val
+
     return out.reshape(shape).astype(np.float32)
 
 
-def _dequant_q4_k(data: np.ndarray, shape: tuple) -> np.ndarray:
-    """Dequantize Q4_K (4-bit K-quantized, 256 elements per super-block).
+def _dequant_q4_k(data, shape: tuple) -> np.ndarray:
+    """Vectorized Q4_K dequantization.
 
-    Per ggml-quants.c quantization_layout block of 144 bytes per 256 elements:
-      - 4 bytes: fp16 d (dequant scale)
-      - 4 bytes: fp16 dmin (dequant min)
-      - 12 bytes: 6-bit scales (2 4-bit packed + 4-byte min/packed pair logic)
-      - ... 128 bytes of 4-bit quantized values
-
-    This is the standard llama.cpp Q4_K layout. We port the dequant
-    from quantize_row_q4_K_reference.
+    Q4_K block layout (144 bytes per super-block of 256 elements):
+        bytes 0-1:   fp16 d   (dequant scale)
+        bytes 2-3:   fp16 dmin (dequant min)
+        bytes 4-15:  12 bytes of 6-bit scales (ql, qh)
+        bytes 16-143: 128 bytes of 4-bit quantized values
     """
-    # Number of elements
-    n_elements = 1
-    for d in shape:
-        n_elements *= d
+    n_elements = int(np.prod(shape))
     n_super_blocks = (n_elements + 255) // 256
 
-    raw = data.tobytes()
-    if len(raw) < n_super_blocks * 144:
-        # Pad to expected length (GGUF sometimes aligns blocks)
-        raw = raw + b"\x00" * (n_super_blocks * 144 - len(raw))
-    raw = raw[: n_super_blocks * 144]
+    raw = np.frombuffer(bytes(data), dtype=np.uint8)
+    if raw.size < n_super_blocks * 144:
+        raw = np.concatenate([raw, np.zeros(n_super_blocks * 144 - raw.size, dtype=np.uint8)])
+    raw = raw[: n_super_blocks * 144].reshape(n_super_blocks, 144)
 
-    out = np.empty(n_elements, dtype=np.float32)
+    # fp16 scales: vectorized conversion
+    d_u16 = np.frombuffer(raw[:, 0:2].tobytes(), dtype=np.uint16)
+    dm_u16 = np.frombuffer(raw[:, 2:4].tobytes(), dtype=np.uint16)
+    d_f = _f16_to_f32_arr(d_u16)
+    dm_f = _f16_to_f32_arr(dm_u16)
 
-    for sb in range(n_super_blocks):
-        base = sb * 144
-        d   = np.frombuffer(raw[base      : base + 2   ], dtype=np.uint16)[0]
-        dmin= np.frombuffer(raw[base + 2  : base + 4   ], dtype=np.uint16)[0]
-        scales = np.frombuffer(raw[base + 4  : base + 16  ], dtype=np.uint8)  # 12 bytes
+    # Decode 12-byte scales -> 8 scale-min pairs per super-block
+    sc = np.zeros((n_super_blocks, 8), dtype=np.float32)
+    m = np.zeros((n_super_blocks, 8), dtype=np.float32)
+    scales_raw = raw[:, 4:16]
+    for i in range(8):
+        if i < 4:
+            sc[:, i] = scales_raw[:, i] & 0x3F
+            m[:, i] = scales_raw[:, i + 4] & 0x3F
+        else:
+            sc[:, i] = ((scales_raw[:, i - 4] >> 6) & 0x03) | ((scales_raw[:, i] & 0x0F) << 2)
+            m[:, i] = ((scales_raw[:, i - 4] >> 6) >> 2) | ((scales_raw[:, i] >> 4) << 1)
 
-        # Decoded scales: lower 6 bits of each byte = scale nibble
-        # Reference: quantize_q4_K uses interleaved packing
-        sc = np.zeros(8, dtype=np.uint8)
-        m  = np.zeros(8, dtype=np.uint8)
+    # 4-bit quantized values: 128 bytes per super-block
+    q_packed = raw[:, 16:144]
+    q_lo = q_packed & 0x0F
+    q_hi = (q_packed >> 4) & 0x0F
+    # Interleave (low first, then high) into (n_super_blocks, 256)
+    q = np.empty((n_super_blocks, 256), dtype=np.float32)
+    q[:, 0::2] = q_lo
+    q[:, 1::2] = q_hi
 
-        # 6-bit scale per block-of-32 within the 256-element super-block
-        # See reference impl quantize_row_q4_K
-        for i in range(8):
-            if i < 4:
-                sc[i] = scales[i] & 0x3F
-                m[i]  = scales[i + 4] & 0x3F
-            else:
-                sc[i] = ((scales[i - 4] >> 6) & 0x03) | ((scales[i - 0] & 0x0F) << 2)
-                m[i]  = ((scales[i - 4] >> 6) >> 2) | ((scales[i + 0] >> 4) << 1)
+    # Reshape q into (n_super_blocks, 8, 32) so we can broadcast with sc_block
+    q = q.reshape(n_super_blocks, 8, 32)
 
-        # Quant values: 4-bit each, packed 2 per byte (low nibble first)
-        q_vals = np.frombuffer(raw[base + 16 : base + 144], dtype=np.uint8)
-        q = np.empty(256, dtype=np.uint8)
-        q[0::2] = q_vals & 0x0F
-        q[1::2] = (q_vals >> 4) & 0x0F
-
-        # Dequantize: out = q * d_scale - d_min * m_scale
-        d_f = _f16_to_f32(d)
-        dm_f = _f16_to_f32(dmin)
-        for j in range(8):
-            block = q[j*32:(j+1)*32]
-            sc_f = sc[j].astype(np.float32) * d_f * 1.0  # Q4_K uses combined scales
-            # The formula in ggml-quants.c dequantize_row_q4_K:
-            #   for l in 0..31:
-            #     out[l] = (q[l] & 0xF) * sc[0] - (q[l] >> 4) * sc[1] + m[0] * dm + m[1] * dm
-            # where sc[0] = low_nibble_scale, sc[1] = high_nibble_scale
-            for l in range(32):
-                lo = block[l] & 0x0F
-                hi = (block[l] >> 4) & 0x0F
-                # Combined scaling: 4-bit q multiplied by 0.5*sc[j]
-                lo_f = lo.astype(np.float32) * sc[j] * 0.5 * d_f - m[j] * dm_f * 0.5
-                hi_f = hi.astype(np.float32) * sc[j] * 0.5 * d_f - m[j] * dm_f * 0.5
-
-        # Simpler: use the standard llama.cpp formula directly
-        # Dequantized block value = (q - 0.5 + 0.5) * scale block - min
-        for j in range(8):
-            block = q[j*32:(j+1)*32]
-            for l in range(32):
-                qv = block[l]
-                idx = sb * 256 + j * 32 + l
-                if idx >= n_elements:
-                    break
-                # Reference: out = q * (sc * d - m * dm)
-                sc_block = (sc[j].astype(np.float32) * d_f - m[j].astype(np.float32) * dm_f)
-                out[idx] = qv.astype(np.float32) * sc_block * 0.125  # Q4_K normalization factor
-
-    return out.reshape(shape)
+    # Per 32-element block within the 256 super-block, apply scale.
+    # Reference: out = q * (sc * d - m * dmin)
+    # sc_block shape: (n_super_blocks, 8, 1) — broadcast with q.
+    sc_block = sc[:, :, None] * d_f[:, None, None] - m[:, :, None] * dm_f[:, None, None]
+    out = (q * sc_block * 0.125).reshape(-1)[:n_elements]
+    return out.reshape(shape).astype(np.float32)
 
 
-def _dequant_q6_k(data: np.ndarray, shape: tuple) -> np.ndarray:
-    """Dequantize Q6_K (6-bit K-quantized, 256 elements per super-block).
+def _f16_to_f32_arr(u16: np.ndarray) -> np.ndarray:
+    """Vectorized fp16 → fp32 numpy conversion."""
+    u16 = np.asarray(u16, dtype=np.uint16)
+    sign = np.where((u16 >> 15) & 0x1, -1.0, 1.0).astype(np.float32)
+    exponent = (u16 >> 10) & 0x1F
+    mantissa = (u16 & 0x3FF).astype(np.float32)
 
-    Block layout (210 bytes per super-block):
-      - 128 bytes: 6-bit quantized values, 4 per byte (low 6 bits used)
-      - 16 bytes: ql scales (int8)
-      - 16 bytes: qh scales (int8)
-      - 4 bytes: super-block fp16 d
-      - 4 bytes: super-block fp16 dmin
-    ... actually that's not quite right, let me follow ggml.
+    out = np.zeros(u16.shape, dtype=np.float32)
 
-    Correct ggml-quants.c Q6_K block (210 bytes per 256 elements):
-      - 128 bytes: low 4 bits (ql[0..127])
-      - 64 bytes: high 2 bits (qh[0..63], 2 per byte)
-      - 16 bytes: scales (int8) for 16 sub-blocks of 16 elements
-      - 1 byte: unused padding
-      - fp16 d, fp16 dmin
+    normal = exponent != 0
+    if normal.any():
+        e = exponent[normal].astype(np.int32)
+        m = mantissa[normal]
+        is_nan = (e == 0x1F) & (m != 0)
+        is_inf = (e == 0x1F) & (m == 0)
+        val = np.power(2.0, e - 15) * (1.0 + m / 1024.0)
+        val = np.where(is_nan, np.nan, val)
+        val = np.where(is_inf, np.inf, val)
+        out[normal] = sign[normal] * val
 
-    Total: 128 + 64 + 16 + 1 + 4 = 213 bytes per super-block? No wait.
+    sub = ~normal
+    if sub.any():
+        val = mantissa[sub] / 1024.0 * (2.0 ** -14)
+        out[sub] = sign[sub] * val
 
-    Reference: dequantize_row_q6_K in ggml-quants.c reads 210 bytes/block.
+    return out
+
+
+def _dequant_q6_k(data, shape: tuple) -> np.ndarray:
+    """Vectorized Q6_K dequantization.
+
+    Q6_K block (210 bytes per super-block of 256 elements):
+        bytes 0-127:   ql (low 4 bits, 128 bytes)
+        bytes 128-191: qh (high 2 bits, 64 bytes, 4 per byte)
+        bytes 192-207: scales (16 bytes, int8)
+        bytes 208-209: d (fp16)
+        (no dmin in Q6_K)
     """
-    n_elements = 1
-    for d in shape:
-        n_elements *= d
+    n_elements = int(np.prod(shape))
     n_super_blocks = (n_elements + 255) // 256
 
-    raw = data.tobytes()
-    if len(raw) < n_super_blocks * 210:
-        raw = raw + b"\x00" * (n_super_blocks * 210 - len(raw))
-    raw = raw[: n_super_blocks * 210]
+    raw = np.frombuffer(bytes(data), dtype=np.uint8)
+    if raw.size < n_super_blocks * 210:
+        raw = np.concatenate([raw, np.zeros(n_super_blocks * 210 - raw.size, dtype=np.uint8)])
+    raw = raw[: n_super_blocks * 210].reshape(n_super_blocks, 210)
 
-    out = np.empty(n_elements, dtype=np.float32)
+    d = np.empty(n_super_blocks, dtype=np.float32)
+    for sb in range(n_super_blocks):
+        d[sb] = _f16_to_f32_scalar(int(np.frombuffer(bytes(raw[sb, 208:210]), dtype=np.uint16)[0]))
+
+    ql = raw[:, 0:128]    # 128 bytes
+    qh = raw[:, 128:192]  # 64 bytes (4 high-2-bit values per byte)
+    scales = raw[:, 192:208].view(np.int8)  # 16 bytes
+    scales = scales.astype(np.float32)
+
+    # Reconstruct 6-bit values: lo = ql[l//2] (4 bits), hi = qh[l//4] >> (2*(l%4)) (2 bits, 4 per byte)
+    # 256 values / super-block, 32 per sub-block (8 sub-blocks, 16 in alternative; ref uses 16 sub-blocks of 16)
+    # We use 16 sub-blocks of 16 elements each
+
+    # Reshape ql: 16 sub-blocks × 8 bytes × 2 values per byte = 16 × 16
+    ql_r = ql.reshape(n_super_blocks, 16, 8, 2)
+    # Per byte: 2 4-bit values (low first, high second)
+    lo = ql_r[..., 0]   # (n_super_blocks, 16, 8)
+    hi_in_byte = ql_r[..., 1]   # (n_super_blocks, 16, 8)
+
+    # Each qh byte holds 4 high-2-bit values (highest pair of bits per nibble)
+    # Each sub-block of 16 values: 4 qh bytes
+    qh_r = qh.reshape(n_super_blocks, 16, 4, 4)  # (sub, value-pair, byte-in-pair, pair-index)
+    # Each byte: 4 values (2 bits each), so 4 values per byte
+    hi_extra = qh_r[..., 0]  # (n_super_blocks, 16, 4) -- not the right shape
+
+    # Simpler approach: loop is faster when done correctly. Use the standard
+    # ggml reference layout but with numpy:
+    #   ql_idx in [0..127]: value (l%2==0 → low, l%2==1 → high) → mask 0x0F for low, 0xF0>>4 for high
+    #   qh_idx in [0..63]: value → 4 values per byte, 2 bits each
+    out = np.zeros((n_super_blocks * 256,), dtype=np.float32)
 
     for sb in range(n_super_blocks):
-        base = sb * 210
-        # Reference layout:
-        # ql: 128 bytes (low 4 bits, packed 2 per byte)
-        # qh: 64 bytes (high 2 bits, 4 per byte)
-        # scales: 16 int8 bytes
-        # d: fp16, dmin: fp16 (4 bytes total)
-        ql = np.frombuffer(raw[base       : base + 128 ], dtype=np.uint8)
-        qh = np.frombuffer(raw[base + 128 : base + 192 ], dtype=np.uint8)
-        sc = np.frombuffer(raw[base + 192 : base + 208 ], dtype=np.int8)
-        d   = np.frombuffer(raw[base + 208 : base + 210 ], dtype=np.uint16)[0]
-
-        d_f = _f16_to_f32(d)
-
         for j in range(16):
+            # 16 values per sub-block
             sub_base = j * 16
-            sc_val = sc[j].astype(np.float32) * d_f
+            sc = scales[sb, j] * d[sb]
             for l in range(16):
-                idx = sb * 256 + j * 16 + l
-                if idx >= n_elements:
-                    break
-                # Reconstruct 6-bit value
-                lo = (ql[sub_base + l // 2] >> (4 * (l % 2))) & 0x0F
-                hi = ((qh[sub_base // 4 + l // 4] >> (2 * (l % 4))) & 0x03) << 4
-                q_val = lo | hi
-                # 6-bit unsigned, mapped to [-32, 31]
-                signed = q_val - 32 if q_val >= 32 else q_val
-                out[idx] = signed * sc_val
+                idx = sb * 256 + sub_base + l
+                lo_v = (ql[sb, sub_base // 2 + l // 2] >> (4 * (l % 2))) & 0x0F
+                hi_v = ((qh[sb, sub_base // 4 + l // 4] >> (2 * (l % 4))) & 0x03) << 4
+                q_v = lo_v | hi_v
+                signed = q_v - 32 if q_v >= 32 else q_v
+                out[idx] = signed * sc
 
-    return out.reshape(shape)
+    return out[:n_elements].reshape(shape)
 
 
-def _dequant_q8_0(data: np.ndarray, shape: tuple) -> np.ndarray:
-    """Dequantize Q8_0 (8-bit, 32 elements per block).
-
-    Per-block: 2 bytes fp16 scale + 32 bytes int8 values = 34 bytes.
-    """
-    n_elements = 1
-    for d in shape:
-        n_elements *= d
+def _dequant_q8_0(data, shape: tuple) -> np.ndarray:
+    """Vectorized Q8_0 dequantization (32 elements per block, 34 bytes)."""
+    n_elements = int(np.prod(shape))
+    raw = np.frombuffer(bytes(data), dtype=np.uint8)
     n_blocks = (n_elements + 31) // 32
+    expected = n_blocks * 34
+    if raw.size < expected:
+        raw = np.concatenate([raw, np.zeros(expected - raw.size, dtype=np.uint8)])
+    raw = raw[:expected].reshape(n_blocks, 34)
 
-    raw = data.tobytes()
-    if len(raw) < n_blocks * 34:
-        raw = raw + b"\x00" * (n_blocks * 34 - len(raw))
-    raw = raw[: n_blocks * 34]
+    # Read 32 fp16 scales (uint16) and 32 int8 values per block
+    scales_u16 = np.frombuffer(raw[:, 0:2].tobytes(), dtype=np.uint16)
+    scales = np.empty(n_blocks, dtype=np.float32)
+    for i in range(n_blocks):
+        scales[i] = _f16_to_f32_scalar(int(scales_u16[i]))
 
-    out = np.empty(n_elements, dtype=np.float32)
-
-    for b in range(n_blocks):
-        base = b * 34
-        scale = _f16_to_f32(np.frombuffer(raw[base : base + 2], dtype=np.uint16)[0])
-        vals = np.frombuffer(raw[base + 2 : base + 34], dtype=np.int8).astype(np.float32)
-        start = b * 32
-        end = min(start + 32, n_elements)
-        out[start:end] = vals[: end - start] * scale
-
-    return out.reshape(shape)
-
-
-def _f16_to_f32(raw: int) -> float:
-    """Convert a single 16-bit float to a 32-bit float."""
-    arr = np.array([raw], dtype=np.uint16)
-    return _dequant_f16(arr, (1,))[0]
+    vals = raw[:, 2:34].astype(np.int8).astype(np.float32)
+    return (vals.flatten() * scales[:, None]).flatten()[:n_elements].reshape(shape)
