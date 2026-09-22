@@ -48,9 +48,11 @@ esac
 # Configure
 cmake -S "$VENDOR_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release $GPU_FLAGS
 
-# Build just the binaries we need (skip server, mtmd, etc for build speed)
+# Build just the binaries we need (skip server, mtmd, etc for build speed).
+# Note: we explicitly omit gguf-dump because its target is broken in the
+# vendored upstream on Windows CMake. llama-cli + llama-quantize are enough.
 cmake --build "$BUILD_DIR" --config Release \
-    --target llama-quantize llama-cli gguf-dump gguf-convert \
+    --target llama-quantize llama-cli gguf-convert \
     -j$(nproc 2>/dev/null || echo 4)
 
 echo ""
