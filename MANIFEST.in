@@ -1,0 +1,14 @@
+include LICENSE
+include README.md
+include pyproject.toml
+
+# Only include the docs/ that ships with the source distribution.
+recursive-include docs *.md
+
+# Exclude tests and dev artifacts from the source distribution.
+# (Tests should not be installed by end users.)
+exclude tests/*
+prune tests
+prune .venv
+prune dist
+prune build

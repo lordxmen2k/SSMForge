@@ -49,6 +49,41 @@ ssmforge arch Qwen/Qwen2-1.5B-Instruct --output report.json
 cat report.json
 ```
 
+## Markdown report (great for GitHub issues)
+
+```bash
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --format markdown > report.md
+```
+
+Produces a GitHub-flavored Markdown document with profile, config table,
+quirk checklist, compatibility, and state_dict breakdown. Paste it
+directly into an issue, PR, or model card.
+
+## Compare two models
+
+```bash
+# JSON diff
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Markdown diff
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --format markdown > diff.md
+```
+
+Useful for:
+- Comparing a fine-tuned model against its base
+- Verifying what a LoRA merge changed
+- Choosing between two candidate source models
+
+## Environment info
+
+```bash
+ssmforge doctor
+```
+
+Prints ssmforge + transformers + HuggingFace cache configuration. Great
+for bug reports.
+
 ## JSON only (pipe to jq)
 
 ```bash
