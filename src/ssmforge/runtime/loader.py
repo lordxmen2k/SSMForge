@@ -186,37 +186,48 @@ def load_hybrid_model_from_gguf(
 def _infer_vocab_size(reader, n_embd: int) -> int:
     """Get the vocab size from the embedding tensor shape.
 
-    NOTE: gguf-py records GGUF metadata shape in llama.cpp convention
-    ([in_features, out_features] for Linear, [hidden, vocab] for embeddings),
-    but t.data returns the array in PyTorch-native layout ([out, in] for Linear,
-    [vocab, hidden] for embeddings). We use t.data.shape because that's the
-    actual byte order on disk / in memory.
+    For BOTH F16/F32 and quantized GGUFs, the GGUF metadata shape is the
+    llama.cpp convention [hidden, vocab] (or [ne[0], ne[1]] more generally).
+    Reversing it gives the PyTorch element shape [vocab, hidden]. We use the
+    reversed metadata shape rather than t.data.shape because t.data.shape is
+    the byte-level shape for quantized tensors (not the element shape).
     """
     for tname in ["model.embed_tokens.weight", "token_embd.weight"]:
         for t in reader.tensors:
             if t.name == tname:
-                # t.data is in PyTorch order: (vocab, hidden)
-                data_shape = tuple(int(s) for s in t.data.shape)
-                if len(data_shape) == 2 and data_shape[1] == n_embd:
-                    return data_shape[0]
-                if len(data_shape) == 2 and data_shape[0] == n_embd:
-                    return data_shape[1]
-                # Fallback: pick the larger dim as vocab
-                return max(data_shape)
+                # GGUF metadata shape: [hidden, vocab] (or sometimes vocab first)
+                meta_shape = tuple(int(s) for s in t.shape)
+                # Reverse to PyTorch order: [vocab, hidden]
+                if len(meta_shape) == 2 and meta_shape[0] == n_embd:
+                    return meta_shape[1]
+                if len(meta_shape) == 2 and meta_shape[1] == n_embd:
+                    return meta_shape[0]
+                return max(meta_shape)
     raise ValueError("No embedding tensor found in GGUF")
 
 
 def _tensors_to_state_dict(reader) -> dict[str, torch.Tensor]:
     """Convert GGUF tensors into a PyTorch state dict.
 
-    IMPORTANT layout note: gguf-py records tensor shape in llama.cpp convention
-    (e.g. [in_features, out_features] for Linear, [hidden, vocab] for embeddings)
-    but t.data returns the array in PyTorch-native byte order
-    ([out, in] for Linear, [vocab, hidden] for embeddings). Since PyTorch
-    loads weights by matching param names and reading the byte order it
-    expects, we must feed it the PyTorch-ordered data and ignore t.shape for
-    the actual ordering. We use t.data.shape (which reflects the byte order)
-    when dequantizing so dequantize() produces the right per-element layout.
+    gguf-py has two layout conventions to be aware of:
+
+    1. For F16 / F32 tensors:
+       - `t.shape` is the GGUF metadata shape in llama.cpp convention
+         ([in_features, out_features] for Linear, [hidden, vocab] for
+         embeddings). This is REVERSED relative to PyTorch.
+       - `t.data.shape` is the **reversed** metadata shape — i.e. the
+         PyTorch-native element layout.
+
+    2. For quantized tensors (Q4_K, Q6_K, Q8_0, ...):
+       - `t.shape` is still GGUF metadata shape (llama.cpp convention).
+       - `t.data.shape` is the **byte-level** shape: the last dim is
+         `(n_elems_per_row / block_size) * bytes_per_block`, NOT the
+         element count. The data is a raw byte buffer packed by super-block.
+
+    So the rules:
+    - For F16/F32: element shape = t.data.shape (already PyTorch order).
+    - For quantized: element shape = tuple(reversed(t.shape.tolist()))
+      (reverse the GGUF metadata convention back to PyTorch order).
     """
     from ssmforge.runtime.dequant import dequantize
 
@@ -224,16 +235,19 @@ def _tensors_to_state_dict(reader) -> dict[str, torch.Tensor]:
 
     for t in reader.tensors:
         ttype = int(t.tensor_type)
-        # gguf-py metadata shape is in llama.cpp convention; use data.shape
-        # for the actual element layout (PyTorch order).
-        data_shape = tuple(int(s) for s in t.data.shape)
 
-        if ttype == _GGML_F32:
-            arr = np.asarray(t.data)
-        elif ttype == _GGML_F16:
-            arr = _f16_to_f32(t.data)
+        if ttype in (_GGML_F16, _GGML_F32):
+            # F16 / F32: data is in PyTorch element order, just cast.
+            element_shape = tuple(int(s) for s in t.data.shape)
+            if ttype == _GGML_F32:
+                arr = np.asarray(t.data).reshape(element_shape).astype(np.float32)
+            else:
+                arr = _f16_to_f32(t.data).reshape(element_shape).astype(np.float32)
         elif ttype in (_GGML_Q4_K, _GGML_Q6_K, _GGML_Q8_0):
-            arr = dequantize(ttype, t.data, data_shape)
+            # Quantized: data is raw bytes per super-block. Compute element
+            # shape by reversing the GGUF metadata convention.
+            element_shape = tuple(int(s) for s in reversed(tuple(t.shape)))
+            arr = dequantize(ttype, t.data, element_shape)
         else:
             raise ValueError(
                 f"Unsupported tensor dtype {ttype} for tensor {t.name}. "

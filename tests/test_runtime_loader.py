@@ -229,3 +229,73 @@ def test_loader_loads_qwen2_style_shapes_clean(tmp_path):
     out = model(input_ids=input_ids)
     assert out.logits.shape == (1, 8, vocab)
     assert torch.isfinite(out.logits).all()
+
+
+def test_loader_loads_q4k_quantized_tensor(tmp_path):
+    """Regression: loader must handle quantized GGUF tensors correctly.
+
+    For Q4_K tensors, gguf-py reports:
+      - t.shape as the GGUF metadata shape (llama.cpp convention: [in, out])
+      - t.data.shape as the BYTE-LEVEL shape: (... , n_elems_per_row / 256 * 144)
+
+    These are different. The loader must reverse the metadata shape to get
+    the PyTorch element shape, then dequantize the raw bytes into that shape.
+
+    This is the bug that caused Qwen2-1.5B Q4_K_M GGUFs to fail with
+    `size mismatch for ... copying a param with shape torch.Size([..., 864])`:
+    the loader was using t.data.shape (864 = 1536/256*144, the byte count)
+    as the element shape instead of reversing t.shape.
+    """
+    # vocab * hidden must be valid for Q4_K (hidden must be multiple of 256)
+    hidden = 256
+    vocab = 4
+    # Each row is hidden=256 elements (= 1 super-block per row).
+    # Total super-blocks = vocab = 4. Total bytes = 4 * 144 = 576.
+    from gguf import GGUFWriter, GGMLQuantizationType
+    from ssmforge.runtime.loader import _tensors_to_state_dict
+
+    q4_path = tmp_path / "q4k_test.q4k.gguf"
+    writer = GGUFWriter(str(q4_path), "ssmforge")
+    writer.add_string("general.architecture", "ssmforge")
+    writer.add_uint32("ssmforge.embedding_length", hidden)
+    writer.add_uint32("ssmforge.block_count", 1)
+    writer.add_uint32("ssmforge.feed_forward_length", hidden)
+    writer.add_uint32("ssmforge.attention.head_count", 1)
+    writer.add_uint32("ssmforge.attention.head_count_kv", 1)
+    writer.add_uint32("ssmforge.context_length", 512)
+
+    # Write a single Q4_K-quantized embed_tokens tensor.
+    # raw_shape in gguf-py is the BYTE-LEVEL shape: (n_rows, bytes_per_row).
+    raw_bytes = np.random.randint(0, 256, size=vocab * 144, dtype=np.uint8).tobytes()
+    writer.add_tensor(
+        "model.embed_tokens.weight",
+        np.frombuffer(raw_bytes, dtype=np.uint8).reshape(vocab, 144),  # byte-level shape
+        raw_shape=[vocab, 144],
+        raw_dtype=GGMLQuantizationType.Q4_K,
+    )
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    # Verify what gguf-py wrote:
+    #   - t.data.shape should be byte-level: (vocab=4, 144)
+    #   - t.shape should be metadata in llama.cpp convention: [hidden, vocab] = [256, 4]
+    #     (gguf converts byte shape (4, 144) → element shape (4, 256), then
+    #     reverses to (256, 4) on write)
+    r2 = GGUFReader(str(q4_path), mode="r")
+    for t in r2.tensors:
+        if "embed_tokens" in t.name:
+            data_shape = tuple(int(s) for s in t.data.shape)
+            meta_shape = tuple(int(s) for s in t.shape)
+            assert data_shape == (vocab, 144), f"data shape {data_shape} should be byte-level"
+            assert meta_shape == (hidden, vocab), f"meta shape {meta_shape} should be [hidden, vocab]"
+            break
+
+    # Now run the loader's tensor extractor. It must dequantize the raw bytes
+    # into the correct PyTorch element shape (vocab, hidden).
+    embed_data = _tensors_to_state_dict(r2)
+    assert "model.embed_tokens.weight" in embed_data
+    embed_t = embed_data["model.embed_tokens.weight"]
+    assert embed_t.shape == (vocab, hidden), \
+        f"dequant shape {tuple(embed_t.shape)} should be (vocab, hidden) = ({vocab}, {hidden})"
