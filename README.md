@@ -36,6 +36,7 @@ ssmforge arch Qwen/Qwen2-1.5B-Instruct
 13. [Troubleshooting](#13-troubleshooting)
 14. [Why this exists](#14-why-this-exists)
 15. [Limitations](#15-limitations)
+16. [Update log](#16-update-log)
 
 ---
 
@@ -58,6 +59,25 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.1.5
+
+| Feature | Why it matters |
+|---------|----------------|
+| `ssmforge arch MODEL --dry-run` | Preview a model's config + memory cost before downloading GBs of weights |
+| `ssmforge --version` / `-V` | Print version, exit 0 — usable in CI scripts |
+| `--output -` | Unix convention: write to stdout instead of a file named `-` |
+| Fail-fast on missing local paths | Was: hangs trying to load as HF id |
+| Memory error → exit 1 + `--dry-run` hint | Was: process killed with exit 127 |
+| Ctrl+C → exit 130 with clean message | Was: traceback dumped to terminal |
+
+Plus 19 new tests (69 total).
+
+### What's new in 0.1.4
+
+- Initial PyPI release
+- 50 tests passing
+- Three user-facing features: `arch`, `--diff`, `doctor`
+
 ---
 
 ## 2. Quickstart (60 seconds)
@@ -65,18 +85,33 @@ inspects.
 If you already have Python 3.10+ and a working `pip`:
 
 ```bash
+# 1. Install
 pip install ssmforge
-ssmforge doctor                              # confirm install works
+
+# 2. Confirm it works (no model download)
+ssmforge doctor
+ssmforge --version            # should print: ssmforge 0.1.5
+
+# 3. Run a tiny test (no HF account needed, ~50 MB download)
+ssmforge arch hf-internal-testing/tiny-random-LlamaForCausalLM --dry-run
+# ^ Config-only, no weights. Fast.
+# Then try with full load:
 ssmforge arch hf-internal-testing/tiny-random-LlamaForCausalLM
+
+# 4. Real model (no HF account needed for these)
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run   # 1 GB — preview first
+ssmforge arch Qwen/Qwen2-0.5B-Instruct             # then load it
 ```
 
-The first arch command downloads the tiny test model (~50 MB), prints a
-JSON report to stdout and a human summary on stderr. Done.
+The `--dry-run` step is now strongly recommended for any model over 1 GB.
+It tells you the memory cost and config-only quirks (GQA, MoE, sliding
+window, etc.) before committing to a multi-GB download.
 
-For a real model:
+For a comparison / diff:
 
 ```bash
-ssmforge arch Qwen/Qwen2-1.5B-Instruct       # downloads ~3 GB on first run
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0
+# Both models are small; full diff downloads both.
 ```
 
 See [Section 4](#4-first-time-setup) for full setup including HuggingFace
@@ -403,6 +438,39 @@ ssmforge arch --help
 
 Use these to see all flags with their descriptions.
 
+### `ssmforge --version` / `-V`
+
+```bash
+ssmforge --version
+# ssmforge 0.1.5
+
+ssmforge -V
+# ssmforge 0.1.5
+```
+
+Print ssmforge's version and exit 0. Useful for scripting:
+
+```bash
+ssmforge --version | awk '{print $2}'   # gets "0.1.5"
+require=$(ssmforge --version | awk '{print $2}')
+if [[ "$require" < "0.1.5" ]]; then
+  echo "ssmforge too old, please upgrade"
+fi
+```
+
+### Special output paths
+
+`--output -` means stdout (Unix convention). Without it, `ssmforge arch MODEL --output -` would *create a file called `-`* in the cwd. The `-` sentinel routes the report to stdout instead:
+
+```bash
+# Pipe JSON straight to jq
+ssmforge arch Qwen/Qwen2-1.5B-Instruct --output - --quiet | jq '.quirks.tied_embeddings'
+# true
+```
+
+`--output PATH` to a path you can't write (read-only dir, missing parent
+dir, permission denied) exits 1 with a clean error message — no traceback.
+
 ---
 
 ## 6. Output formats
@@ -669,13 +737,26 @@ The `analyze/` package exposes:
 | Code | Meaning | What to do |
 |------|---------|------------|
 | `0` | Analyzed successfully, no blockers | Continue with your pipeline |
+| `1` | Could not load or analyze the model | Check stderr for details — network, auth, missing path, OOM, or `--output` write failure |
 | `2` | Analyzed successfully, but model has a blocker | Currently only MoE blocks. Check `compatibility.blockers` in the JSON |
-| `1` | Could not load or analyze the model | Check the error message; usually a network, auth, or path issue |
+| `130` | Interrupted by Ctrl+C | You pressed Ctrl+C during load. Re-run when ready |
 
 Use exit codes in shell pipelines:
 
 ```bash
 ssmforge arch mistralai/Mixtral-8x7B-Instruct-v0.1 && echo "OK" || echo "BLOCKED"
+```
+
+In CI:
+
+```bash
+ssmforge arch $MODEL
+case $? in
+  0) ;;                  # OK
+  2) handle_moe;;        # MoE blocked
+  130) exit 1;;          # user interrupted
+  1) handle_load_error;; # look at stderr
+esac
 ```
 
 ---
@@ -793,6 +874,33 @@ ls -lh $HF_HOME/hub/
 rm -rf $HF_HOME/hub/models--Qwen--Qwen2-1.5B-Instruct
 ```
 
+**`memory allocation of N bytes failed` / Out of memory during load**
+
+ssmforge catches these and exits 1 with a hint. The model needs more RAM
+than you have free. Two options:
+
+```bash
+# 1. Preview the model first to see how much RAM it needs
+ssmforge arch mistralai/Mixtral-8x7B-v0.1 --dry-run
+# Memory estimate: ~13.49 GB in bfloat16 (7.24B params)
+# Compatibility: BLOCKED by: moe
+
+# 2. Use a smaller model or a machine with more RAM
+ssmforge arch Qwen/Qwen2-0.5B-Instruct   # only 1 GB, fits almost anywhere
+```
+
+**`Error: local path does not exist: /tmp/foo`**
+
+You passed a local path that doesn't exist. ssmforge fails fast instead
+of hanging trying to load it as an HF model id. Either fix the path or
+drop the leading `/`, `./`, or `~/` if you meant an HF id like
+`Qwen/Qwen2-1.5B-Instruct`.
+
+**Ctrl+C mid-load**
+
+Exit code 130 with a clean `Interrupted.` message — no traceback. Just
+re-run when ready.
+
 **First run is slow**
 
 Expected. The first `ssmforge arch MODEL` downloads the model. The next
@@ -889,6 +997,73 @@ What ssmforge **does not** do:
 The PyPI package has zero PyTorch / GGUF / mamba-ssm dependencies. It's
 intentionally minimal — if you only need to inspect, this is what you
 install.
+
+---
+
+## 16. Update log
+
+### v0.1.5 (current) — 2026-09-22
+
+**New features:**
+- `ssmforge arch MODEL --dry-run` — config-only mode. No weight download.
+  Reports memory cost and config-only quirks (GQA, MQA, MoE, sliding window,
+  soft-capping, partial RoPE, rope_theta). Works with `--diff` for
+  config-only diffs.
+- `ssmforge --version` / `-V` — print version + exit 0.
+
+**Bug fixes:**
+- `--output -` now means stdout (Unix convention), not a file named `-`.
+- Local paths that don't exist fail fast with a clear error, instead of
+  hanging trying to load them as HF model ids.
+- `--output` to a non-writable or non-existent path exits 1 with a clean
+  message, not a traceback.
+- Ctrl+C during load prints `Interrupted.` and exits 130, not a traceback.
+- Memory allocation failures during load exit 1 with a hint to use
+  `--dry-run`, not the OS kill signal (exit 127).
+- `MoE` is now detected from the config alone — `--dry-run` reports
+  `Compatibility: BLOCKED by: moe` without downloading any weights.
+
+**Tests:** 69 passed (was 50). 19 new tests for the v0.1.5 features.
+
+**Python API additions:**
+- `ssmforge.analyze.build_report_from_config(model_id, config)`
+- `ssmforge.analyze.scan_config_only(config)`
+- `ssmforge.analyze.estimate_params_from_config(config)`
+- `ssmforge.analyze.estimate_memory_bytes(params, dtype)`
+
+### v0.1.4 — 2026-09-22
+
+First PyPI release. Three user-facing features:
+
+- `ssmforge arch MODEL` — JSON + human summary report
+- `ssmforge arch MODEL --diff OTHER` — compare two architectures
+- `ssmforge doctor` — environment + cache info
+
+50 tests passing. Detects 15 architectural quirks including attention
+bias, tied embeddings, fused QKV, fused gate-up, GQA, MQA, MoE, sliding
+window, soft-capping, partial RoPE, MLP type, norm type, layer scale,
+num experts, moe top-k.
+
+PyPI: https://pypi.org/project/ssmforge/
+
+### Notes for upgrading from earlier versions
+
+If you previously installed ssmforge from a different source or a
+pre-PyPI development build, upgrade to pick up v0.1.5:
+
+```bash
+pip install --upgrade ssmforge
+ssmforge --version
+# ssmforge 0.1.5
+```
+
+If you have an old editable install from the v0.0.x development series,
+uninstall it first:
+
+```bash
+pip uninstall ssmforge
+pip install ssmforge
+```
 
 ---
 
