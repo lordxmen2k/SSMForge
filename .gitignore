@@ -20,6 +20,18 @@ venv/
 .env.local
 *.local.yaml
 
+# HuggingFace caches — never commit model weights.
+# The user's HF cache may live anywhere (HF_HOME, $HOME/.cache, etc.).
+# Block any path that looks like an HF cache root.
+**/.cache/
+**/hub/
+**/datasets/
+**/CACHEDIR.TAG
+**/.locks/
+**/blobs/
+**/snapshots/
+**/refs/
+
 # Test artifacts
 tests/fixtures/llama-1b-tiny/*.safetensors
 tests/fixtures/llama-1b-tiny/*.bin
@@ -30,3 +42,7 @@ htmlcov/
 # Output examples (keep .gitkeep)
 out/
 *.gguf
+
+# Windows / drive-letter paths should never be tracked.
+# (Safety net in case HF_HOME points at a drive like G:/models)
+/[A-Z]:/
