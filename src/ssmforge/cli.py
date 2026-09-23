@@ -454,6 +454,15 @@ def main(argv: list[str] | None = None) -> None:
         help="Emit only the profile section (family, attention_type, mlp_type, "
              "norm_type, descriptors). Useful for quick eyeball checks.",
     )
+    arch_p.add_argument(
+        "--graph", action="store_true",
+        help="Render a text-based decision-graph of the model's architecture "
+             "in your terminal. Shows the flow from input → embed → attn + MLP + "
+             "norms → final norm → lm_head, with each architectural choice "
+             "(fused QKV, GQA, SwiGLU vs GeLU, MoE, tied embeddings, etc.) "
+             "listed inline with its verdict. With --compare, renders an "
+             "N-way decision table.",
+    )
 
     # ---- doctor subcommand ----
     doctor_p = subparsers.add_parser(
@@ -576,6 +585,12 @@ def _cmd_arch(args) -> None:
             output_text = json.dumps(_profile_only_report(report_a), indent=2)
             _write_or_print(output_text, args.output)
             sys.exit(0 if is_compat else 2)
+        # --graph emits the architecture decision graph
+        if args.graph:
+            from ssmforge.analyze.graph import render_graph_text
+            output_text = render_graph_text(report_a)
+            _write_or_print(output_text, args.output)
+            sys.exit(0 if is_compat else 2)
         # --fields subsets the report
         if args.fields:
             report_a = _subset_report(report_a, args.fields)
@@ -605,6 +620,11 @@ def _cmd_arch(args) -> None:
                              _profile_only_report(report_b)["profile"]],
             }
             _write_or_print(json.dumps(output, indent=2), args.output)
+            sys.exit(0)
+        if args.graph:
+            from ssmforge.analyze.graph import render_graph_compare
+            output_text = render_graph_compare(reports)
+            _write_or_print(output_text, args.output)
             sys.exit(0)
         if args.fields:
             report_a = _subset_report(report_a, args.fields)
@@ -636,6 +656,13 @@ def _cmd_arch(args) -> None:
             ],
         }
         _write_or_print(json.dumps(output, indent=2), args.output)
+        sys.exit(0)
+
+    # --graph: emit N-way architecture decision table
+    if args.graph:
+        from ssmforge.analyze.graph import render_graph_compare
+        output_text = render_graph_compare(reports)
+        _write_or_print(output_text, args.output)
         sys.exit(0)
 
     # --fields: subset each report before comparison

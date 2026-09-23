@@ -59,6 +59,16 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.2.0
+
+| Feature | Why it matters |
+|---------|----------------|
+| `--graph` | Render a text-based architecture decision graph in your terminal. Single-model shows the dataflow with decisions inline. `--compare --graph` shows an N-way decision table with a "Differ across N models" footer. |
+| New `analyze.graph` module | `render_graph_text()` and `render_graph_compare()` are exposed for Python API use — embed them in your own tooling. |
+| `--full` for `--graph` (implicit) | `--graph` works with `--dry-run`. Quirks that need weight inspection (MLP type, norm type, fused QKV, attention_bias) show as "unknown" with a note pointing at `--full`. Drop `--dry-run` to get the full answer. |
+
+Plus 19 new tests (130 total).
+
 ### What's new in 0.1.9
 
 | Fix | What was broken |
@@ -403,6 +413,7 @@ ssmforge arch <model_id_or_path> [options]
 | `--fields name1,name2` | | Subset output to comma-separated field names. Dotted paths supported (e.g. `quirks.attention_bias`) | all |
 | `--profile` | | Emit only the profile section (family, attention_type, mlp_type, norm_type, descriptors) | full report |
 | `--only-different` | | In `--compare` mode, hide the "Identical across all models" section | show identical |
+| `--graph` | | Render a text-based decision-graph in your terminal. Single-model shows the full pipeline with decisions inline. `--compare --graph` shows an N-way decision table. | JSON |
 
 **Examples:**
 
@@ -437,6 +448,114 @@ ssmforge arch /path/to/local/model --output local-report.json
 # Skip summary (only print JSON)
 ssmforge arch mistralai/Mistral-7B-v0.1 --quiet
 ```
+
+### Visual decision graph (`--graph`)
+
+`--graph` renders a text-based architecture decision graph in your terminal.
+The output shows the model's dataflow (input → embed → attn + MLP + norms →
+final norm → lm_head) with each architectural choice marked inline with its
+verdict. In `--compare` mode, it shows an N-way decision table that lists
+where the models differ.
+
+This is the view you want when you're deciding whether a model is
+compatible with your downstream pipeline (quantizer, hybrid-SSM converter,
+GGUF exporter). It tells you the choices that matter, not the raw config.
+
+**Single-model graph (Qwen2-0.5B):**
+
+```bash
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --graph
+```
+
+```
+Qwen/Qwen2-0.5B-Instruct    (24 layers, hidden=896, heads=14 kv:2, ffn=4864, vocab=151936, dtype=bf16)
+
+  INPUT
+    │
+  embed_tokens ─── lm_head ─→ TIED ✓
+    │
+    ├─  ┌──────────────────────────────────────────────────────────┐
+    │   │ ATTENTION (one of 24 layers)                          │
+    │   │   ├─ fused QKV          ──── NO    # separate q, k, v projections
+    │   │   ├─ GQA                ──── YES (kv:2 of 14)    # 2 KV heads vs 14 Q heads
+    │   │   ├─ attention bias     ──── NO    # no bias terms (Llama convention)
+    │   │   ├─ rope_theta         ──── 1e+06                 # rotary position embedding base
+    │   │   └─→ output projection (o_proj)
+    │   │
+    │   │ MLP (gated, SwiGLU when --full)
+    │   │   ├─ MLP type           ──── unknown   # requires --full inspection (config-only scan can't classify)
+    │   │   └─ fused gate/up      ──── NO    # separate gate_proj and up_proj
+    ▼
+  final_norm
+  logits [151936]
+
+  KEY DECISIONS (for downstream tooling):
+    NO     fused QKV              separate q, k, v projections
+    YES (kv:2 of 14) GQA         2 KV heads vs 14 Q heads
+    NO     attention bias         no bias terms (Llama convention)
+    1e+06  rope_theta             rotary position embedding base
+    NO     fused gate/up          separate gate_proj and up_proj
+    NO     Tied embeddings        lm_head and embed_tokens are independent
+
+  Params: ~494M    Memory: 942.2 MB @ bfloat16
+  Memory @ int8: 471.1 MB    Memory @ int4: 235.6 MB
+```
+
+The `KEY DECISIONS` block is the actionable summary — every line tells
+you a choice that affects how a downstream tool (quantizer, converter)
+has to handle the model.
+
+**N-way compare graph (multiple models):**
+
+```bash
+ssmforge arch --compare Qwen/Qwen2-0.5B-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --dry-run --graph
+```
+
+```
+Decision           Qwen/Qwen2-0.5B-Instruct  TinyLlama/TinyLlama-1.1B-Chat-v1.0
+──────────────────────────────────────────────────────────────────────────
+
+--- Attention ---
+fused QKV          no                        no
+MQA / GQA          GQA (kv:2/14)             GQA (kv:4/32)
+attention bias     no                        no
+rope_theta         1000000                   10000
+rope_scaling       None                      None
+sliding_window     None                      None
+
+--- MLP ---
+MLP type           unknown                   unknown
+fused gate/up      no                        no
+
+--- Normalization ---
+Norm type          unknown                   unknown
+
+--- Other ---
+Tied embeddings    YES                       no
+
+--- Geometry ---
+hidden_size        896                       2048
+num_layers         24                        22
+params             494M                      1.10B
+memory @ bf16      942.2 MB                  2.0 GB
+
+──────────────────────────────────────────────────────────────────────────
+Differ across 2 models: MQA / GQA, rope_theta, Tied embeddings, hidden_size, num_layers, params, memory @ bf16
+```
+
+The "Differ across N models" footer lists which decisions actually
+disagree — read this to spot architectural drift between model sizes
+or families.
+
+**Notes:**
+
+- The graph mode prints to stdout, so you can pipe to `less` or
+  redirect to a file with `> architecture.txt`.
+- Exit code matches normal rules: 0 if compatible, 2 if blockers
+  found.
+- In `--compare --graph` mode, exit is always 0 (compare itself
+  is informational, not a verdict).
 
 ### Comparing 2+ models (`--compare`)
 
@@ -851,6 +970,8 @@ The `analyze/` package exposes:
 - `diff_reports(a, b)` — diff two reports
 - `compare_reports(reports_list)` — N-way comparison of 2+ reports
 - `format_compare_markdown(comparison)` — render a comparison as a Markdown table
+- `render_graph_text(report)` — render a single-model architecture decision graph (see [Visual decision graph](#visual-decision-graph--graph))
+- `render_graph_compare(reports_list)` — render an N-way architecture decision table (>= 2 reports)
 - `QuirkReport` — dataclass for the raw quirk scan
 - `scan_state_dict(state_dict, config, num_layers)` — lower-level scan
 - `count_state_dict_summary(state_dict)` — tensor breakdown
@@ -1173,7 +1294,45 @@ install.
 
 ## 16. Update log
 
-### v0.1.9 (current) — 2026-09-22
+### v0.2.0 (current) — 2026-09-22
+
+**New feature: `--graph`**
+
+- Single-model: renders a text-based decision graph of the architecture.
+  Shows input → embed → attn (with fused QKV / GQA / attention_bias /
+  rope_theta decisions inline) → MLP (SwiGLU / GeGLU / MoE verdict) →
+  final norm → lm_head → logits. Plus a `KEY DECISIONS` summary
+  block at the bottom that lists every choice a downstream tool
+  needs to know about, and a memory estimate line for the active
+  dtype plus int8 / int4 projections.
+- Compare (`--compare --graph`): renders an N-way decision table.
+  Each row is one architectural decision; each column is one model.
+  A "Differ across N models" footer lists the decisions that
+  actually disagree.
+
+Why semver 0.2.0: this is a new visual output mode (not just an
+additive flag), and the CLI's `--graph` flag changes the parsing
+shape. Per semver rules, that's a minor-version bump.
+
+Implementation: new `ssmforge/analyze/graph.py` module exposes
+`render_graph_text(report)` and `render_graph_compare(reports)`
+for Python API users.
+
+Tests: 130 passed (was 111). 19 new tests:
+- `_clean_dtype`, `_fmt_params`, `_fmt_bytes`, `_yesno` (4 helpers)
+- `_gqa_label` covers MQA / GQA / MHA correctly with both dict and
+  SimpleNamespace config inputs
+- `render_graph_text` covers: basic structure, tied embeddings,
+  rope_theta formatting, dtype normalization, dry-run unknown fields
+  with honest "requires --full inspection" notes, header layers count,
+  attention box layer count (regression for `{layers}` literal bug)
+- `render_graph_compare` covers: 2-model header, 3-model list,
+  identical-models-no-diff message, per-model GQA labels (regression
+  for hardcoded `kv:2` label), single-model fallback, empty input
+
+Plus 130 total tests passing.
+
+### v0.1.9 — 2026-09-22
 
 **Bug fixes:**
 
