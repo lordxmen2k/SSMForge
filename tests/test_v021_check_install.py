@@ -284,3 +284,89 @@ def test_attention_bias_config_false_stays_false(monkeypatch):
     )
     report = scan_state_dict(state_dict, config=cfg)
     assert report.attention_bias is False
+
+
+# ---------- v0.2.2: --output directory validation ----------
+
+def test_check_output_path_none_returns_safe():
+    """No --output flag → (None, None); no validation needed."""
+    from ssmforge.cli import _check_output_path
+    parent, err = _check_output_path(None)
+    assert parent is None
+    assert err is None
+
+
+def test_check_output_path_dash_returns_safe():
+    """`--output -` means stdout → (None, None)."""
+    from ssmforge.cli import _check_output_path
+    parent, err = _check_output_path("-")
+    assert parent is None
+    assert err is None
+
+
+def test_check_output_path_writable_dir_is_ok(tmp_path):
+    """Writing into an existing writable dir → (parent, None)."""
+    from ssmforge.cli import _check_output_path
+    target = tmp_path / "report.md"
+    parent, err = _check_output_path(str(target))
+    assert parent is not None
+    assert err is None
+
+
+def test_check_output_path_missing_parent_returns_error(tmp_path):
+    """Writing into a non-existent parent dir → error with hint."""
+    from ssmforge.cli import _check_output_path
+    target = tmp_path / "nonexistent_subdir" / "report.md"
+    parent, err = _check_output_path(str(target))
+    assert parent is not None
+    assert err is not None
+    assert "does not exist" in err
+    assert "--output ./report.md" in err  # hint present
+
+
+def test_check_output_path_unwritable_returns_error(tmp_path):
+    """If parent is read-only, return error with alternative suggestions."""
+    from ssmforge.cli import _check_output_path
+    import stat
+    # Create a read-only directory
+    ro_dir = tmp_path / "readonly"
+    ro_dir.mkdir()
+    ro_dir.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)  # 0o555 = read+exec
+    try:
+        target = ro_dir / "report.md"
+        parent, err = _check_output_path(str(target))
+        # On Windows chmod is partially ignored, so skip if write somehow allowed
+        if not os.access(ro_dir, os.W_OK):
+            assert err is not None
+            assert "Permission denied" in err
+            assert "writable location" in err
+        else:
+            # Windows-style: chmod didn't actually block writes; skip
+            pass
+    finally:
+        ro_dir.chmod(stat.S_IRWXU)  # restore for cleanup
+
+
+def test_write_or_print_rejects_unwritable_directory(tmp_path, capsys):
+    """Actual end-to-end test: --output to bad path → exit 1 with hint."""
+    from ssmforge.cli import _write_or_print, main
+    import stat
+    # Create a read-only dir
+    ro_dir = tmp_path / "readonly"
+    ro_dir.mkdir()
+    ro_dir.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    target = ro_dir / "report.md"
+    try:
+        if not os.access(ro_dir, os.W_OK):
+            # Unix: chmod actually blocks
+            with pytest.raises(SystemExit) as exc:
+                _write_or_print("test content", str(target))
+            assert exc.value.code == 1
+            captured = capsys.readouterr()
+            assert "writable location" in captured.err
+            assert "--output" in captured.err
+        else:
+            # Windows: chmod ignored, skip the actual test
+            pass
+    finally:
+        ro_dir.chmod(stat.S_IRWXU)

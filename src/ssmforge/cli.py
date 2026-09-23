@@ -282,16 +282,70 @@ def _format_dry_run_summary(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _check_output_path(output_path: str | None) -> tuple[Path | None, str | None]:
+    """Pre-flight check on an --output target before writing.
+
+    Returns ``(parent_dir_or_None, error_message_or_None)``:
+    - ``(None, None)`` when output_path is None or '-' (stdout).
+    - ``(parent_dir, None)`` when the directory exists and is writable.
+    - ``(parent_dir, error_message)`` when the path can't be written.
+
+    The error_message is a user-friendly hint that names the actual problem
+    (missing parent dir, not a directory, permission denied) and suggests
+    writable alternatives when appropriate.
+    """
+    if not output_path or output_path == "-":
+        return None, None
+    p = Path(output_path)
+    parent = p.parent if str(p.parent) else Path(".")
+    # Catch a bare filename like 'report.md' (parent is '.') which DOES work
+    parent = parent.resolve()
+    # Case 1: parent doesn't exist
+    if not parent.exists():
+        return parent, (
+            f"Error: output directory does not exist: {parent}\n"
+            f"  Hint: create the directory first, or use a writable location.\n"
+            f"  Try: --output ./report.md  (current working directory)"
+        )
+    # Case 2: parent exists but is a file (not a dir)
+    if parent.is_file():
+        return parent, (
+            f"Error: output path's parent is a file, not a directory: {parent}"
+        )
+    # Case 3: parent is not writable
+    if not os.access(parent, os.W_OK):
+        return parent, (
+            f"Error: cannot write to directory: {parent}\n"
+            f"  Permission denied.\n"
+            f"  Try a writable location like:\n"
+            f"    --output ./report.md        (current directory)\n"
+            f"    --output ~/report.md        (your home directory)\n"
+            f"    --output $TMPDIR/report.md  (system temp)"
+        )
+    return parent, None
+
+
 def _write_or_print(text: str, output_path: str | None) -> None:
     """Write text to a file if path given, else print to stdout.
 
     Special-case: if output_path is '-', print to stdout (Unix convention).
+    Pre-flight checks the parent directory exists and is writable; on
+    failure prints a friendly hint and exits 1.
     """
     if output_path and output_path != "-":
+        parent, err = _check_output_path(output_path)
+        if err is not None:
+            print(err, file=sys.stderr)
+            sys.exit(1)
         try:
-            Path(output_path).write_text(text, encoding="utf-8")
+            p = Path(output_path)
+            p.write_text(text, encoding="utf-8")
         except (PermissionError, FileNotFoundError, IsADirectoryError, OSError) as e:
-            print(f"Error: cannot write to {output_path!r}: {e}", file=sys.stderr)
+            print(
+                f"Error: cannot write to {output_path!r}: {e}\n"
+                f"  Hint: try --output ./report.md for the current directory",
+                file=sys.stderr,
+            )
             sys.exit(1)
         print(f"Report written to {output_path}", file=sys.stderr)
     else:

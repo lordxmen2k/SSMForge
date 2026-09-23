@@ -59,6 +59,14 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.2.2
+
+| Fix | What was broken |
+|-----|-----------------|
+| `--output PATH` with bad parent dir | Previously got a generic `bash: Permission denied` (when redirecting) or a Python traceback (when using `--output`). Now pre-flight checks the parent directory, prints a clear hint pointing at writable locations like `./` and `~/`, then exits 1. |
+
+Plus 6 new tests (162 total). Tiny release — main bug fix only.
+
 ### What's new in 0.2.1
 
 | Feature | Why it matters |
@@ -1369,7 +1377,44 @@ install.
 
 ## 16. Update log
 
-### v0.2.1 (current) — 2026-09-23
+### v0.2.2 (current) — 2026-09-23
+
+**Bug fix: `--output PATH` directory validation**
+
+When `--output PATH` points to a non-writable location, users were getting
+either a generic shell `Permission denied` (when using shell redirection)
+or an opaque Python `OSError` (when using `--output` directly). Now
+ssmforge pre-flight checks the parent directory and prints a friendly
+hint pointing at writable alternatives.
+
+**Before:**
+```
+$ python -m ssmforge.cli arch X --graph --format markdown > q.md
+bash: q.md: Permission denied
+
+$ python -m ssmforge.cli arch X --graph --format markdown --output C:\q.md
+Error: cannot write to 'C:\\q.md': [Errno 13] Permission denied: 'C:\\q.md'
+```
+
+**After:**
+```
+$ python -m ssmforge.cli arch X --graph --format markdown > q.md
+# (still works in any shell that allows the redirect)
+
+$ python -m ssmforge.cli arch X --graph --format markdown --output C:\q.md
+Error: cannot write to directory: C:\
+  Permission denied.
+  Try a writable location like:
+    --output ./report.md        (current directory)
+    --output ~/report.md        (your home directory)
+    --output $TMPDIR/report.md  (system temp)
+```
+
+Tests: 162 passed (was 156). 6 new tests for `_check_output_path`
+(returns (None, None) for None / '-' paths, validates writability,
+emits helpful hints for missing or read-only parents).
+
+### v0.2.1 — 2026-09-23
 
 **New feature: `doctor --check-install`**
 
