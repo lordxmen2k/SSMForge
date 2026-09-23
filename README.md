@@ -59,6 +59,16 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.2.1
+
+| Feature | Why it matters |
+|---------|----------------|
+| `doctor --check-install` | Diagnoses "ssmforge: command not found" in one command. Prints `✓` when on PATH, `✗` + a copy-pasteable fix hint when not. Exits non-zero so you can use it in scripts. |
+| One-time PATH warning | First invocation when `ssmforge` is off-PATH prints a hint to stderr pointing at `python -m ssmforge.cli`. Suppressed by `SSMFORGE_NO_PATH_WARN=1`. Skipped for `doctor` so its output stays clean. |
+| README install lead | Section 4.2 now recommends a venv more strongly + explains why + gives `python -m ssmforge.cli` as the universal workaround. |
+
+Plus 12 new tests (142 total).
+
 ### What's new in 0.2.0
 
 | Feature | Why it matters |
@@ -229,7 +239,13 @@ If you don't have it:
 - macOS: `brew install python@3.12`
 - Windows: download from https://www.python.org/downloads/
 
-### 4.2 Create a virtual environment (recommended)
+### 4.2 Create a virtual environment (recommended — strongly)
+
+**Use a venv.** It sidesteps the most common install problem on Windows
+(`ssmforge: command not found` after pip install). With a venv, the
+`ssmforge` script lands at `.venv\Scripts\ssmforge.exe` (Windows) or
+`.venv/bin/ssmforge` (Linux/macOS), which is automatically on PATH after
+you activate.
 
 A venv keeps ssmforge and its dependencies isolated from system Python.
 
@@ -249,6 +265,15 @@ python -m venv .venv
 
 You should see `(.venv)` in your prompt after activating. From here on,
 `pip install` only affects this venv.
+
+**Alternative: use `python -m ssmforge.cli`** as a workaround without a
+venv. Works anywhere, doesn't need any PATH setup, but requires typing
+`python -m ssmforge.cli` instead of just `ssmforge`.
+
+```bash
+python -m ssmforge.cli --version
+python -m ssmforge.cli arch hf-internal-testing/tiny-random-LlamaForCausalLM --dry-run
+```
 
 ### 4.3 Install ssmforge
 
@@ -391,6 +416,52 @@ JSON variant:
 
 ```bash
 ssmforge doctor --format json
+```
+
+#### `ssmforge doctor --check-install`
+
+Run install checks (PATH, scripts location) and exit non-zero on issues.
+Useful in scripts or when troubleshooting "command not found":
+
+```bash
+ssmforge doctor --check-install
+```
+
+```
+ssmforge doctor --check-install (0.2.1)
+--------------------------------------------------
+  ✓ ssmforge command on PATH: True
+  python: C:\Users\netge\.venv\Scripts\python.exe
+  platform: win32
+```
+
+If `ssmforge` isn't on PATH, you get a fix-hint block:
+
+```
+ssmforge doctor --check-install (0.2.1)
+--------------------------------------------------
+  ✗ ssmforge command on PATH: False
+  python: C:\Python314\python.exe
+  platform: win32
+
+The 'ssmforge' script was installed to:
+    C:\Users\netge\AppData\Roaming\Python\Python314\Scripts\ssmforge.exe
+but that folder is not on PATH.
+
+  Quick fix (current shell):
+    export PATH="/c/Users/netge/AppData/Roaming/Python/Python314/Scripts:$PATH"
+
+  Permanent fix (PowerShell, restart shell after):
+    [Environment]::SetEnvironmentVariable("PATH", "<scripts>;" + [Environment]::GetEnvironmentVariable("PATH", "User"), "User")
+
+  Or just use: python -m ssmforge.cli
+```
+
+JSON variant:
+
+```bash
+ssmforge doctor --check-install --format json
+# {"ssmforge_command_on_path": false, "fix_hint": "...", ...}
 ```
 
 ### `ssmforge arch MODEL`
@@ -1091,7 +1162,7 @@ use a newer Python.
 **`pip install ssmforge` succeeds but `ssmforge` command not found**
 
 The install put the script in a directory not on your PATH. Activate
-your venv (see [4.2](#42-create-a-virtual-environment-recommended)) or
+your venv (see [4.2](#42-create-a-virtual-environment-recommended-strongly)) or
 check `pip show ssmforge` for the install location.
 
 **`ssmforge: command not found` after `pip install` succeeds (Windows)**
@@ -1294,7 +1365,55 @@ install.
 
 ## 16. Update log
 
-### v0.2.0 (current) — 2026-09-22
+### v0.2.1 (current) — 2026-09-23
+
+**New feature: `doctor --check-install`**
+
+Run install checks (PATH, scripts location, platform) and exit non-zero
+when something is wrong. Use in scripts or when troubleshooting:
+
+```bash
+ssmforge doctor --check-install
+# prints ✓ or ✗ + fix hint
+echo $?  # 0 = good, 1 = something off
+```
+
+The fix-hint output is a copy-pasteable shell command — exactly the
+right `export PATH=...` or `[Environment]::SetEnvironmentVariable(...)`
+line for your platform.
+
+**New: one-time PATH warning on stderr**
+
+When ssmforge detects it's been installed off-PATH, every `ssmforge
+arch ...` call prints a one-time hint to stderr:
+
+```
+Note: 'ssmforge' is not on your PATH for `python -m ssmforge.cli` users.
+      This is normal if you're running via 'python -m ssmforge.cli'.
+      If 'ssmforge --version' fails, see: https://github.com/lordxmen2k/SSMForge#troubleshooting
+```
+
+This is suppressed:
+- when ssmforge IS on PATH
+- when the user explicitly runs `ssmforge doctor ...`
+- when `SSMFORGE_NO_PATH_WARN=1` is set in the env
+
+**README install lead**
+
+Section 4.2 (Create a virtual environment) now leads with a stronger
+recommendation and a fallback path (`python -m ssmforge.cli`). No
+changes to the install command itself — just clearer context.
+
+Tests: 142 passed (was 130). 12 new tests:
+- `_check_ssmforge_on_path`: returns correct tuple, finds off-path
+  install, returns no fix when on PATH
+- `_warn_path_once`: writes to stderr when off-path, respects env
+  var, skips when on PATH
+- `main()` integration: suppresses warning for doctor, emits for arch
+- `doctor --check-install`: text output on/off PATH, JSON output,
+  exit codes (0 / 1), back-compat with default `doctor`
+
+### v0.2.0 — 2026-09-22
 
 **New feature: `--graph`**
 

@@ -313,6 +313,82 @@ def _check_local_path(source: str) -> None:
         sys.exit(1)
 
 
+def _check_ssmforge_on_path() -> tuple[bool, str | None]:
+    """Best-effort detection of whether the `ssmforge` command is on PATH.
+
+    Returns ``(on_path, fix_hint)``. Always returns successfully; never raises
+    or exits. Used by `_cmd_doctor` and the main() pre-dispatch warning.
+
+    Detection strategy:
+    - On Windows / MINGW64, look for `%APPDATA%\\Python\\Python<ver>\\Scripts\\ssmforge.exe`
+    - On POSIX, look for `which("ssmforge")` (which uses PATH + $PATHEXT)
+    - If we got here via `python -m ssmforge.cli`, the script wrapper exists
+      somewhere — we just don't know if it's on PATH.
+
+    If we can detect a typical Windows user-site Scripts dir that *isn't* on
+    PATH, we return a concrete fix string. Otherwise we just return the
+    on/off state.
+    """
+    import shutil
+    on_path = shutil.which("ssmforge") is not None
+
+    if on_path:
+        return True, None
+
+    # On Windows the most common missing-PATH case is `%APPDATA%\Python\Scripts`
+    if sys.platform.startswith("win"):
+        py_ver = f"{sys.version_info.major}{sys.version_info.minor}"
+        candidates = [
+            os.path.join(os.environ.get("APPDATA", ""), "Python", f"Python{py_ver}", "Scripts"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", f"Python{py_ver}", "Scripts"),
+            os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Roaming", "Python", f"Python{py_ver}", "Scripts"),
+        ]
+        for cand in candidates:
+            if cand and os.path.isdir(cand):
+                exe = os.path.join(cand, "ssmforge.exe")
+                if os.path.isfile(exe):
+                    fix = (
+                        f"The 'ssmforge' script was installed to:\n"
+                        f"    {exe}\n"
+                        f"but that folder is not on PATH.\n\n"
+                        f"  Quick fix (current shell):\n"
+                        f"    export PATH=\"{cand}:$PATH\"\n\n"
+                        f"  Permanent fix (PowerShell, restart shell after):\n"
+                        f"    [Environment]::SetEnvironmentVariable(\"PATH\", \"{cand};\" + [Environment]::GetEnvironmentVariable(\"PATH\", \"User\"), \"User\")\n\n"
+                        f"  Or just use: python -m ssmforge.cli\n"
+                        f"  See: https://github.com/lordxmen2k/SSMForge#troubleshooting"
+                    )
+                    return False, fix
+        return False, "ssmforge installed but 'ssmforge' command not on PATH. Use 'python -m ssmforge.cli' instead, or add Scripts to PATH."
+    else:
+        # On Linux/macOS, missing-on-PATH is rare; defer to `python -m`
+        return False, "ssmforge installed but 'ssmforge' command not on PATH. Use 'python -m ssmforge.cli' instead."
+
+
+def _warn_path_once(ctx: str) -> None:
+    """Print a one-time warning if `ssmforge` is not on PATH.
+
+    Called from main() before the actual subcommand dispatch. Suppressed
+    when ``SSMFORGE_NO_PATH_WARN`` is set, or when the user is already
+    invoking via `python -m ssmforge.cli` (which we can't easily detect
+    from inside main(), so we just use a try/except to stay quiet).
+    """
+    if os.environ.get("SSMFORGE_NO_PATH_WARN"):
+        return
+    try:
+        on_path, fix = _check_ssmforge_on_path()
+    except Exception:
+        return  # never break the CLI on a path check
+    if on_path:
+        return
+    print(
+        f"Note: 'ssmforge' is not on your PATH for `python -m ssmforge.cli` users.\n"
+        f"      This is normal if you're running via 'python -m ssmforge.cli'.\n"
+        f"      If 'ssmforge --version' fails, see: https://github.com/lordxmen2k/SSMForge#troubleshooting",
+        file=sys.stderr,
+    )
+
+
 def _install_signal_handlers() -> None:
     """Make Ctrl+C print a clean message instead of a traceback."""
     def _sigint_handler(sig, frame):
@@ -360,6 +436,14 @@ def _quiet_transformers_warnings() -> None:
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the `ssmforge` command."""
     _install_signal_handlers()
+
+    # One-time PATH warning (suppressed by SSMFORGE_NO_PATH_WARN=1)
+    # Skip for `ssmforge doctor --check-install` itself so its output stays clean.
+    # When called via `python -m ssmforge.cli`, argv is None — fall back to
+    # sys.argv[1:].
+    effective_argv = argv if argv is not None else sys.argv[1:]
+    if not (effective_argv and effective_argv[0] == "doctor"):
+        _warn_path_once("main")
 
     # Show version on --version
     if argv and argv[0] in ("--version", "-V", "version") and (len(argv) == 1 or argv[1].startswith("-")):
@@ -472,6 +556,12 @@ def main(argv: list[str] | None = None) -> None:
     doctor_p.add_argument(
         "--format", "-f", default="text", choices=["text", "json"],
         help="Output format (default: text)",
+    )
+    doctor_p.add_argument(
+        "--check-install", action="store_true",
+        help="Run only the installation checks (PATH, scripts, venv) and "
+             "print the result. Exits non-zero if anything is wrong so you "
+             "can use it in scripts.",
     )
 
     args = parser.parse_args(argv)
@@ -732,6 +822,30 @@ def _cmd_doctor(args) -> None:
         info["huggingface_hub_version"] = huggingface_hub.__version__
     except ImportError:
         info["huggingface_hub_version"] = "(not installed)"
+
+    # --check-install: run the install checks only, exit non-zero on issues.
+    if args.check_install:
+        on_path, fix = _check_ssmforge_on_path()
+        result = {
+            "ssmforge_command_on_path": on_path,
+            "fix_hint": fix,
+            "platform": sys.platform,
+            "python_executable": sys.executable,
+            "ssmforge_version": info["ssmforge_version"],
+        }
+        if args.format == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            mark = "✓" if on_path else "✗"
+            print(f"ssmforge doctor --check-install ({info['ssmforge_version']})")
+            print("-" * 50)
+            print(f"  {mark} ssmforge command on PATH: {on_path}")
+            print(f"  python: {sys.executable}")
+            print(f"  platform: {sys.platform}")
+            if not on_path and fix:
+                print()
+                print(fix)
+        sys.exit(0 if on_path else 1)
 
     if args.format == "json":
         print(json.dumps(info, indent=2))
