@@ -111,6 +111,21 @@ def _fake_config(hidden=64, n_layers=2, inter=128, vocab=100, n_heads=4, n_kv_he
 
 def test_scan_detects_attention_bias():
     sd = _fake_state_dict_qwen2()
+    # _fake_state_dict_qwen2 uses zeros for biases (vestigial, like real Qwen2).
+    # v0.2.1 fix: attention_bias stays False when biases are all zero.
+    # We still record that bias keys are present (informational).
+    report = scan_state_dict(sd)
+    assert report.attention_bias is False
+    assert any("q_proj.bias" in k for k in report.bias_keys_found)
+
+
+def test_scan_detects_nonzero_attention_bias():
+    """When bias tensors are non-zero (Phi-3 / Mistral-style), quirk = True."""
+    sd = _fake_state_dict_qwen2()
+    # Replace zero biases with non-zero ones to simulate a real bias-using model
+    for k in list(sd.keys()):
+        if k.endswith(".bias"):
+            sd[k] = torch.randn_like(sd[k])
     report = scan_state_dict(sd)
     assert report.attention_bias is True
     assert any("q_proj.bias" in k for k in report.bias_keys_found)
@@ -242,7 +257,12 @@ def test_build_report_qwen2():
     )
     assert report["model_id"] == "Qwen/Qwen2-test"
     assert report["model_type"] == "test"
-    assert report["quirks"]["attention_bias"] is True
+    # Qwen2 has config.attention_bias=None (the actual config ships it that way)
+    # AND the weights include vestigial zero-initialized bias tensors.
+    # Config wins per the v0.2.1 fix — quirk reports False (Qwen convention).
+    # The bias_keys_found list still records that the tensors are present.
+    assert report["quirks"]["attention_bias"] is False
+    assert len(report["quirks"]["bias_keys_found"]) > 0
     assert report["quirks"]["tied_embeddings"] is True
     assert report["quirks"]["grouped_attention"] is True
     assert report["compatibility"] is not None
@@ -419,10 +439,11 @@ def test_resolves_rope_theta_from_direct_field():
 def test_reports_attention_bias_from_state_dict_when_config_missing():
     """Config doesn't expose attention_bias but state_dict has biases.
 
-    Some HF configs (Qwen2 in older transformers) have attention_bias=None
-    at the config level, but the actual weights ship with biases. The
-    report should show the truth (state_dict detected) rather than the
-    config default (False).
+    Some HF configs (Qwen2) have attention_bias=None at the config level
+    but ship with vestigial zero-initialized bias tensors. Per v0.2.1 fix:
+    config.attention_bias=None + zero biases → quirk is False (vestigial).
+
+    We verify that the bias keys are still recorded for transparency.
     """
     from types import SimpleNamespace
     cfg = SimpleNamespace(
@@ -435,8 +456,10 @@ def test_reports_attention_bias_from_state_dict_when_config_missing():
         attention_bias=None,  # config doesn't expose this
         torch_dtype="bfloat16",
     )
-    sd = _fake_state_dict_qwen2()  # has biases
+    sd = _fake_state_dict_qwen2()  # has biases (zero in fake_qwen2 helper)
     report = build_report("test/qwen2", cfg, sd)
-    # The state_dict has biases; report should reflect that
-    assert report["config"]["attention_bias"] is True
-    assert report["quirks"]["attention_bias"] is True
+    # Zero biases + None config = quirk is False (vestigial like real Qwen2)
+    assert report["config"]["attention_bias"] is False
+    assert report["quirks"]["attention_bias"] is False
+    # But the bias_keys_found list still records that the tensors exist
+    assert any("q_proj.bias" in k for k in report["quirks"]["bias_keys_found"])

@@ -198,3 +198,89 @@ def test_doctor_default_still_works(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "ssmforge doctor" in captured.out
     assert "ssmforge_version" in captured.out
+
+
+# ---------- Regression: attention_bias config overrides weight presence ----------
+
+def test_attention_bias_config_none_does_not_override_to_true(monkeypatch):
+    """When config.attention_bias is None (e.g. Qwen2), weight-side bias
+    tensors should NOT auto-set attention_bias to True.
+
+    Regression: v0.2.0's full-load path detected Qwen2 as 'attention_bias=True'
+    because the weights include zero-initialized bias tensors. The config says
+    'no biases' (None + Qwen convention), so that's what we should report.
+    """
+    from ssmforge.analyze.state_dict_scan import scan_state_dict, QuirkReport
+    from types import SimpleNamespace
+
+    # Simulate a tiny Qwen2-like model with bias tensors AND config.attention_bias=None
+    state_dict = {
+        # layer 0
+        "model.layers.0.self_attn.q_proj.weight":  __import__("numpy").zeros((896, 896)),
+        "model.layers.0.self_attn.q_proj.bias":    __import__("numpy").zeros((896,)),
+        "model.layers.0.self_attn.k_proj.weight":  __import__("numpy").zeros((128, 896)),
+        "model.layers.0.self_attn.k_proj.bias":    __import__("numpy").zeros((128,)),
+        "model.layers.0.self_attn.v_proj.weight":  __import__("numpy").zeros((128, 896)),
+        "model.layers.0.self_attn.v_proj.bias":    __import__("numpy").zeros((128,)),
+        "model.layers.0.self_attn.o_proj.weight":  __import__("numpy").zeros((896, 896)),
+        "model.layers.0.self_attn.o_proj.bias":    __import__("numpy").zeros((896,)),
+        # sample layer 1 to make sure num_layers detection works
+        "model.layers.1.self_attn.q_proj.weight":  __import__("numpy").zeros((896, 896)),
+    }
+    cfg = SimpleNamespace(
+        model_type="qwen2", architectures=["Qwen2ForCausalLM"],
+        vocab_size=151936, hidden_size=896, intermediate_size=4864,
+        num_hidden_layers=2, num_attention_heads=14, num_key_value_heads=2,
+        attention_bias=None,  # the key field
+        tie_word_embeddings=True,
+        rope_theta=None, rope_parameters={"rope_theta": 1000000.0},
+        rope_scaling=None, rms_norm_eps=1e-6,
+    )
+
+    report = scan_state_dict(state_dict, config=cfg)
+    assert report.attention_bias is False, (
+        f"Qwen2-like with attention_bias=None should report False even though "
+        f"bias tensors exist. Got {report.attention_bias}, "
+        f"bias_keys_found={report.bias_keys_found}"
+    )
+    # But we DO record that the bias tensors are present (informational)
+    assert len(report.bias_keys_found) > 0
+
+
+def test_attention_bias_config_true_overrides_to_true(monkeypatch):
+    """When config.attention_bias=True, quirk should be True even without weights."""
+    from ssmforge.analyze.state_dict_scan import scan_config_only, QuirkReport
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        model_type="phi3", architectures=["Phi3ForCausalLM"],
+        vocab_size=32000, hidden_size=128, intermediate_size=256,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        attention_bias=True,  # explicit
+        tie_word_embeddings=False,
+        rope_theta=None, rope_parameters={"rope_theta": 10000.0},
+        rope_scaling=None,
+    )
+    report = scan_config_only(cfg)
+    assert report.attention_bias is True
+
+
+def test_attention_bias_config_false_stays_false(monkeypatch):
+    """When config.attention_bias=False (Llama), quirk is False. Even if bias
+    tensors were somehow present, config wins."""
+    from ssmforge.analyze.state_dict_scan import scan_state_dict
+    from types import SimpleNamespace
+    state_dict = {
+        "model.layers.0.self_attn.q_proj.bias": __import__("numpy").zeros((64,)),
+    }
+    cfg = SimpleNamespace(
+        model_type="llama", architectures=["LlamaForCausalLM"],
+        vocab_size=32000, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        attention_bias=False,  # Llama convention
+        tie_word_embeddings=False,
+        rope_theta=None, rope_parameters={"rope_theta": 10000.0},
+        rope_scaling=None, rms_norm_eps=1e-5,
+    )
+    report = scan_state_dict(state_dict, config=cfg)
+    assert report.attention_bias is False

@@ -298,6 +298,44 @@ def _write_or_print(text: str, output_path: str | None) -> None:
         print(text)
 
 
+def _render_graph_single(report: dict, fmt: str) -> str:
+    """Render a single-model graph in the requested format.
+
+    fmt: 'text' (default ASCII), 'json', 'markdown'/'md'.
+    Raises ValueError on unsupported format — caller should fall back to text.
+    """
+    from ssmforge.analyze.graph import (
+        render_graph_text,
+        render_graph_json,
+        render_graph_markdown,
+    )
+    f = (fmt or "text").lower()
+    if f in ("markdown", "md"):
+        return render_graph_markdown(report)
+    if f == "json":
+        return render_graph_json(report)
+    if f == "text":
+        return render_graph_text(report)
+    raise ValueError(f"unsupported --format for --graph: {fmt!r}")
+
+
+def _render_graph_compare(reports: list[dict], fmt: str) -> str:
+    """Render an N-way compare graph in the requested format."""
+    from ssmforge.analyze.graph import (
+        render_graph_compare,
+        render_graph_compare_json,
+        render_graph_compare_markdown,
+    )
+    f = (fmt or "text").lower()
+    if f in ("markdown", "md"):
+        return render_graph_compare_markdown(reports)
+    if f == "json":
+        return render_graph_compare_json(reports)
+    if f == "text":
+        return render_graph_compare(reports)
+    raise ValueError(f"unsupported --format for --compare --graph: {fmt!r}")
+
+
 def _check_local_path(source: str) -> None:
     """If `source` looks like a local path, fail fast if it doesn't exist.
 
@@ -494,7 +532,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Write report to this file (use '-' for stdout). Format chosen by --format.",
     )
     arch_p.add_argument(
-        "--format", "-f", default="json", choices=["json", "markdown", "md"],
+        "--format", "-f", default="json", choices=["text", "json", "markdown", "md"],
         help="Output format (default: json). markdown/md is GitHub-friendly.",
     )
     arch_p.add_argument(
@@ -600,9 +638,12 @@ def _cmd_arch(args) -> None:
         all_models = []
         if args.source:
             all_models.append(args.source)
-        for m in args.compare:
-            if m not in all_models:
-                all_models.append(m)
+        # Append everything in --compare, verbatim. We do NOT dedupe.
+        # `arch A --compare A` is valid and means "compare A with itself"
+        # (output: all_identical=True). `arch A --compare A B` means
+        # "[A, A, B]" which is a 3-way compare with A in the comparison twice —
+        # slightly redundant but unambiguous; the user explicitly asked for it.
+        all_models.extend(args.compare)
         # Need at least 2 for compare
         if len(all_models) < 2:
             print(
@@ -675,10 +716,13 @@ def _cmd_arch(args) -> None:
             output_text = json.dumps(_profile_only_report(report_a), indent=2)
             _write_or_print(output_text, args.output)
             sys.exit(0 if is_compat else 2)
-        # --graph emits the architecture decision graph
+        # --graph emits the architecture decision graph (text/json/markdown via --format)
         if args.graph:
-            from ssmforge.analyze.graph import render_graph_text
-            output_text = render_graph_text(report_a)
+            try:
+                output_text = _render_graph_single(report_a, args.format)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(2)
             _write_or_print(output_text, args.output)
             sys.exit(0 if is_compat else 2)
         # --fields subsets the report
@@ -712,8 +756,11 @@ def _cmd_arch(args) -> None:
             _write_or_print(json.dumps(output, indent=2), args.output)
             sys.exit(0)
         if args.graph:
-            from ssmforge.analyze.graph import render_graph_compare
-            output_text = render_graph_compare(reports)
+            try:
+                output_text = _render_graph_compare(reports, args.format)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(2)
             _write_or_print(output_text, args.output)
             sys.exit(0)
         if args.fields:
@@ -748,10 +795,13 @@ def _cmd_arch(args) -> None:
         _write_or_print(json.dumps(output, indent=2), args.output)
         sys.exit(0)
 
-    # --graph: emit N-way architecture decision table
+    # --graph: emit N-way architecture decision table (text/json/markdown)
     if args.graph:
-        from ssmforge.analyze.graph import render_graph_compare
-        output_text = render_graph_compare(reports)
+        try:
+            output_text = _render_graph_compare(reports, args.format)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
         _write_or_print(output_text, args.output)
         sys.exit(0)
 

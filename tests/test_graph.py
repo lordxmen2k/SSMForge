@@ -158,12 +158,14 @@ def test_render_graph_text_layers_count_in_header():
     assert "hidden=896" in out
 
 
-def test_render_graph_text_attention_box_includes_layers():
-    """Attention box should reflect the actual layer count, not literal {layers}."""
+def test_render_graph_text_layer_count_in_pipeline():
+    """Pipeline should reflect the actual layer count somewhere visible."""
     cfg = _make_cfg(num_hidden_layers=8)
     report = build_report_from_config("fake/x", cfg)
     out = render_graph_text(report)
-    assert "one of 8 layers" in out
+    # Layer count appears in the head_line and the "× N LAYER BLOCKS" header
+    assert "8 layers" in out
+    assert "× 8 LAYER BLOCKS" in out
     assert "{layers}" not in out  # regression: was a literal in early draft
 
 
@@ -259,3 +261,140 @@ def test_cli_arch_graph_single(monkeypatch):
 
     # Just verify the dispatch path is exercised; we don't run the full main() here
     assert callable(fake_render)
+
+
+# ---------- render_graph_json ----------
+
+def test_render_graph_json_basic_structure():
+    """JSON output has the expected top-level keys."""
+    import json as _json
+    cfg = _make_cfg(num_attention_heads=4, num_key_value_heads=4)
+    report = build_report_from_config("fake/test", cfg)
+    from ssmforge.analyze.graph import render_graph_json
+    out = render_graph_json(report)
+    parsed = _json.loads(out)
+    assert parsed["model_id"] == "fake/test"
+    assert "geometry" in parsed
+    assert "pipeline" in parsed
+    assert "decisions" in parsed
+    assert parsed["dry_run"] is True
+    # geometry has the head_line info
+    assert parsed["geometry"]["hidden_size"] == 64
+    assert parsed["geometry"]["num_attention_heads"] == 4
+
+
+def test_render_graph_json_pipeline_stages():
+    """Pipeline includes embed_tokens, layer_block, final_norm, logits stages."""
+    import json as _json
+    cfg = _make_cfg()
+    report = build_report_from_config("fake/test", cfg)
+    from ssmforge.analyze.graph import render_graph_json
+    parsed = _json.loads(render_graph_json(report))
+    stages = [s["stage"] for s in parsed["pipeline"]]
+    assert "input" in stages
+    assert "embed_tokens" in stages
+    assert "layer_block" in stages
+    assert "final_norm" in stages
+    assert "logits" in stages
+    # embed_tokens has tied_to_lm_head
+    embed_stage = next(s for s in parsed["pipeline"] if s["stage"] == "embed_tokens")
+    assert "tied_to_lm_head" in embed_stage
+    assert "verdict" in embed_stage
+
+
+def test_render_graph_json_decisions_include_verdicts():
+    """Decisions list has structured entries with verdict + note."""
+    import json as _json
+    cfg = _make_cfg()
+    report = build_report_from_config("fake/test", cfg)
+    from ssmforge.analyze.graph import render_graph_json
+    parsed = _json.loads(render_graph_json(report))
+    assert len(parsed["decisions"]) > 0
+    for d in parsed["decisions"]:
+        assert "category" in d
+        assert "verdict" in d
+        assert "note" in d
+
+
+# ---------- render_graph_markdown ----------
+
+def test_render_graph_markdown_basic():
+    """Markdown has the expected sections."""
+    cfg = _make_cfg()
+    report = build_report_from_config("fake/test", cfg)
+    from ssmforge.analyze.graph import render_graph_markdown
+    out = render_graph_markdown(report)
+    assert "# `fake/test`" in out
+    assert "**Geometry:**" in out
+    assert "## Pipeline" in out
+    assert "## Architectural decisions" in out
+    assert "| Category | Verdict | Note |" in out  # decisions table header
+
+
+def test_render_graph_markdown_renders_in_gfm():
+    """Markdown output should be GFM-compatible (no broken table syntax)."""
+    cfg = _make_cfg(num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=True)
+    report = build_report_from_config("fake/qwen", cfg)
+    from ssmforge.analyze.graph import render_graph_markdown
+    out = render_graph_markdown(report)
+    # No pipes inside table cells (would break GFM tables)
+    table_lines = [l for l in out.split("\n") if l.startswith("|")]
+    for line in table_lines:
+        # Cells separated by `|` — count should be sane (3 cells in our decisions table)
+        assert line.count("|") >= 3, f"malformed table line: {line!r}"
+
+
+# ---------- render_graph_compare_json ----------
+
+def test_render_graph_compare_json_basic():
+    """JSON compare output has expected structure."""
+    import json as _json
+    cfg_a = _make_cfg(hidden_size=2048)
+    cfg_b = _make_cfg(hidden_size=896, tie_word_embeddings=True)
+    r_a = build_report_from_config("a", cfg_a)
+    r_b = build_report_from_config("b", cfg_b)
+    from ssmforge.analyze.graph import render_graph_compare_json
+    parsed = _json.loads(render_graph_compare_json([r_a, r_b]))
+    assert parsed["comparison_type"] == "graph"
+    assert parsed["model_count"] == 2
+    assert parsed["models"] == ["a", "b"]
+    assert len(parsed["decisions"]) > 0
+    # Differences list shows the differing decisions
+    assert "Tied embeddings" in parsed["differences"]
+
+
+def test_render_graph_compare_json_identical_models():
+    """Two identical reports → all_identical=True, differences=[]."""
+    import json as _json
+    cfg = _make_cfg()
+    r1 = build_report_from_config("same", cfg)
+    r2 = build_report_from_config("same", cfg)
+    from ssmforge.analyze.graph import render_graph_compare_json
+    parsed = _json.loads(render_graph_compare_json([r1, r2]))
+    assert parsed["all_identical"] is True
+    assert parsed["differences"] == []
+
+
+# ---------- render_graph_compare_markdown ----------
+
+def test_render_graph_compare_markdown_basic():
+    """Markdown compare has a table with one column per model."""
+    cfg_a = _make_cfg(hidden_size=2048)
+    cfg_b = _make_cfg(hidden_size=896, tie_word_embeddings=True)
+    r_a = build_report_from_config("a", cfg_a)
+    r_b = build_report_from_config("b", cfg_b)
+    from ssmforge.analyze.graph import render_graph_compare_markdown
+    out = render_graph_compare_markdown([r_a, r_b])
+    assert "# Architecture decision comparison" in out
+    assert "| Category | a | b |" in out
+    assert "Differ across 2 models" in out
+
+
+def test_render_graph_compare_markdown_no_diff_message():
+    """When all models agree, render the 'all models agree' footer."""
+    cfg = _make_cfg()
+    r1 = build_report_from_config("same", cfg)
+    r2 = build_report_from_config("same", cfg)
+    from ssmforge.analyze.graph import render_graph_compare_markdown
+    out = render_graph_compare_markdown([r1, r2])
+    assert "All models agree" in out

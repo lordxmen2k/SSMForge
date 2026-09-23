@@ -216,3 +216,29 @@ def test_cli_compare_fails_fast_on_bad_path():
         main(["arch", "--compare", "fake/A", "/tmp/no-such-path-12345",
               "--dry-run", "--quiet"])
     assert exc.value.code == 1
+
+
+# ---------- Regression: --compare A A should be a valid 2-way "identical" report ----------
+
+def test_cli_compare_same_model_twice_is_valid(monkeypatch):
+    """`ssmforge arch A --compare A` should produce a 2-way identical report,
+    not error out with '--compare requires at least 2 models'.
+
+    Regression: dedup logic collapsed A A to [A] and refused to proceed.
+    """
+    from ssmforge.cli import main
+    import json as _json
+
+    cfg = _make_cfg()
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=cfg)
+    cm.__exit__ = MagicMock(return_value=False)
+
+    # Two calls to _arch_load_progress, returning the same model both times
+    with patch("ssmforge.cli._arch_load_progress", return_value=cm) as mock_loader:
+        with pytest.raises(SystemExit) as exc:
+            main(["arch", "fake/A", "--compare", "fake/A", "--dry-run", "--quiet"])
+    # Should exit cleanly (0 for compatible), NOT error 1
+    assert exc.value.code == 0
+    # Loader called twice (one per model in compare list)
+    assert mock_loader.call_count == 2

@@ -65,9 +65,13 @@ inspects.
 |---------|----------------|
 | `doctor --check-install` | Diagnoses "ssmforge: command not found" in one command. Prints `✓` when on PATH, `✗` + a copy-pasteable fix hint when not. Exits non-zero so you can use it in scripts. |
 | One-time PATH warning | First invocation when `ssmforge` is off-PATH prints a hint to stderr pointing at `python -m ssmforge.cli`. Suppressed by `SSMFORGE_NO_PATH_WARN=1`. Skipped for `doctor` so its output stays clean. |
+| `--graph --format {text,json,markdown}` | `--graph` now respects `--format`. Single + compare modes emit ASCII (text), structured JSON (for pipelines), or GitHub-flavored Markdown (for docs/Issues). |
+| `--graph` ASCII cleanup | Box-drawing hierarchy fixed: single-rail `▼` flow + box `╭╮╰╯` panels for ATTENTION and MLP, `├─/└─` decision-tree style inside. |
+| Qwen2 attention_bias fixed | `config.attention_bias=None` + zero bias tensors (Qwen2's vestigial biases) no longer reports `attention_bias=True`. Now requires either config explicit True OR non-zero bias values. |
+| `--compare A A` is now valid | Was previously dedup'd to `[A]` and rejected. Now produces a 2-way "all identical" report. |
 | README install lead | Section 4.2 now recommends a venv more strongly + explains why + gives `python -m ssmforge.cli` as the universal workaround. |
 
-Plus 12 new tests (142 total).
+Plus 26 new tests (156 total).
 
 ### What's new in 0.2.0
 
@@ -484,7 +488,7 @@ ssmforge arch <model_id_or_path> [options]
 | `--fields name1,name2` | | Subset output to comma-separated field names. Dotted paths supported (e.g. `quirks.attention_bias`) | all |
 | `--profile` | | Emit only the profile section (family, attention_type, mlp_type, norm_type, descriptors) | full report |
 | `--only-different` | | In `--compare` mode, hide the "Identical across all models" section | show identical |
-| `--graph` | | Render a text-based decision-graph in your terminal. Single-model shows the full pipeline with decisions inline. `--compare --graph` shows an N-way decision table. | JSON |
+| `--graph` | | Render a text-based decision-graph in your terminal. Single-model shows the full pipeline with decisions inline. `--compare --graph` shows an N-way decision table. Honors `--format` (`text`, `json`, `markdown`/`md`) for JSON pipeline consumption and GFM-friendly docs. | JSON |
 
 **Examples:**
 
@@ -1403,6 +1407,57 @@ This is suppressed:
 Section 4.2 (Create a virtual environment) now leads with a stronger
 recommendation and a fallback path (`python -m ssmforge.cli`). No
 changes to the install command itself — just clearer context.
+
+**Bug fix: Qwen2 attention_bias false positive**
+
+Previously, `scan_state_dict` set `attention_bias=True` whenever
+`*self_attn.*.bias` tensors existed in the state dict. Qwen2 ships
+zero-initialized bias tensors (vestigial, never used) and was
+incorrectly reported as having attention biases.
+
+Now: `attention_bias` is set to True only when **either** the config
+explicitly says `attention_bias=True` **or** the bias tensors contain
+non-zero values. The `bias_keys_found` list still records that the
+tensors exist for transparency.
+
+Tests:
+- `test_scan_detects_attention_bias` (updated) — zero biases → False
+- `test_scan_detects_nonzero_attention_bias` (new) — non-zero → True
+- `test_reports_attention_bias_from_state_dict_when_config_missing`
+  (updated) — config.attention_bias=None + zero biases → False
+
+**Bug fix: `--compare A A` no longer rejected**
+
+Previously `--compare A A` was dedup'd to `[A]` and rejected with
+"requires at least 2 models". Now produces a valid 2-way "all identical"
+report.
+
+**Feature: `--graph` honors `--format {text,json,markdown}`**
+
+Three output modes for `--graph`:
+- `--format text` (default for `--graph`) — ASCII with box-drawing
+- `--format json` — structured pipeline + decisions for piping into
+  other tools
+- `--format markdown`/`md` — GitHub-flavored Markdown tables for
+  embedding in docs, Issues, PRs
+
+All three work for both single-model and `--compare --graph` modes.
+
+**Bug fix: `--graph` ASCII hierarchy**
+
+The previous box-drawing had two parallel rails (`├─` and `▼`) that
+suggested two unrelated flows. Replaced with single-rail `▼` flow and
+`╭╮╰╯` panels for ATTENTION and MLP blocks. Decision-tree style
+`├─/└─` inside each panel. Renders correctly in any terminal.
+
+**Tests: 156 passed** (was 142). 14 new tests:
+- 12 from `test_v021_check_install.py` (PATH detection, doctor
+  --check-install, main() integration)
+- 1 from `test_v017_compare.py` (`--compare A A` regression)
+- 1 from `test_analyze.py` (nonzero attention_bias detection)
+- 13 from `test_graph.py` (JSON/Markdown formatters, GFM
+  compatibility, edge cases)
+- (some overlap with existing test updates for attention_bias fix)
 
 Tests: 142 passed (was 130). 12 new tests:
 - `_check_ssmforge_on_path`: returns correct tuple, finds off-path

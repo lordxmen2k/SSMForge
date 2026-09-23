@@ -258,13 +258,43 @@ def scan_state_dict(state_dict: dict, config: Any = None, num_layers: int | None
     layer0_keys = _layer_zero_keys(state_dict, layer_prefix)
 
     # ---- Attention bias ----
+    # Config is the source of truth when explicitly set:
+    #   attention_bias=True  → quirk = True (Phi-3, some Mistral variants)
+    #   attention_bias=False → quirk = False (Llama)
+    #   attention_bias=None  → fall back to weight inspection (most models)
+    # Qwen2 sets None but ships vestigial zero-initialized bias tensors, so
+    # weight-only detection overcounts for that family. Cross-checking the
+    # config AND checking that the bias values are non-zero avoids the false
+    # positive: only set quirk=True if at least one bias has non-zero values.
+    config_bias = getattr(config, "attention_bias", None)
     bias_keys = [
         k for k in layer0_keys
         if "self_attn." in k and k.endswith(".bias")
     ]
     if bias_keys:
-        report.attention_bias = True
         report.bias_keys_found = sorted(bias_keys)
+        if config_bias is True:
+            report.attention_bias = True  # config + weights agree
+        elif config_bias is None:
+            # Check if at least one bias tensor has non-zero values
+            any_nonzero = False
+            for k in bias_keys:
+                t = state_dict.get(k)
+                if t is None:
+                    continue
+                try:
+                    # Cheap check without importing torch here
+                    import numpy as _np
+                    arr = _np.asarray(t)
+                    if arr.size and _np.any(arr != 0):
+                        any_nonzero = True
+                        break
+                except Exception:
+                    pass
+            if any_nonzero:
+                report.attention_bias = True
+            # else: bias tensors are all-zero (vestigial like Qwen2); leave quirk False
+        # config_bias is False: report stays False (config wins)
 
     # ---- Fused QKV (Phi-3) ----
     fused_qkv_keys = [
@@ -489,6 +519,16 @@ def scan_config_only(config: Any) -> QuirkReport:
 
     if config is None:
         return report
+
+    # attention_bias: trust the config when explicit.
+    # Config explicit True/False is the source of truth (Phi-3=True, Llama=False).
+    # Config=None means "use defaults" — for those models the actual answer
+    # needs weight inspection, so we leave the quirk as False here and let the
+    # full-load path override it (e.g. for actual bias-using architectures
+    # whose config happens to use the None default).
+    config_bias = getattr(config, "attention_bias", None)
+    if config_bias is True:
+        report.attention_bias = True
 
     # GQA / MQA from config
     n_heads = getattr(config, "num_attention_heads", None)

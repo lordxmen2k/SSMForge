@@ -170,7 +170,7 @@ def test_diff_identical_models():
 
 
 def test_diff_different_architectures():
-    """Diff between Qwen2 and Llama should show attention_bias and tied_embeddings."""
+    """Diff between Qwen2 and Llama should show tied_embeddings and grouped_attention."""
     sd_q, _, _ = _fake_qwen2_sd()
     cfg_q = _fake_qwen2_config()
     report_q = build_report("Qwen/Qwen2", cfg_q, sd_q)
@@ -182,12 +182,13 @@ def test_diff_different_architectures():
     diff = diff_reports(report_q, report_l)
     assert diff["identical"] is False
     assert len(diff["differences"]) > 0
-    # Qwen2 has attention_bias; Llama doesn't — so removed when Qwen2 -> Llama
     diff_fields = [d["field"] for d in diff["differences"]]
-    assert "attention_bias_in_state_dict" in diff_fields
+    # Qwen2 has tied embeddings (config says True) + grouped attention (kv:2/4); Llama doesn't
+    assert "tie_word_embeddings" in diff_fields
+    assert "grouped_attention" in diff_fields
     assert "rope_theta" in diff_fields
-    # MnML: removed quirks when going Qwen2 -> Llama
-    assert "attention_bias_in_state_dict" in diff["removed_quirks"]
+    # Note: attention_bias is False for both in v0.2.1 (Qwen2 has zero biases),
+    # so it's no longer a diff field. grouped_attention IS the differentiator.
 
 
 def test_cli_arch_diff_mode(capsys):

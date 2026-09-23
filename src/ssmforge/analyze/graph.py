@@ -228,54 +228,79 @@ def render_graph_text(report: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append(head_line)
     lines.append("")
+
+    # Single-rail dataflow. Each line either shows the rail alone (just │/▼)
+    # or the rail plus a side annotation. Box-drawing uses only three glyphs:
+    #   │  : rail continues vertically (no branching)
+    #   ▼  : flow moves to the next stage
+    #   └──: last item in a group (or └─ for non-last)
+    # Box for the layer detail is a single block with consistent width.
+    tied = config.get("tie_word_embeddings", False)
+
+    # Build a helper: indent the rail at depth N, return the "current rail" prefix
+    # for any line that should show the rail on the left.
+
+    # === Top of pipeline ===
     lines.append("  INPUT")
     lines.append("    │")
-    tied = config.get("tie_word_embeddings", False)
     if tied:
+        lines.append("    ▼")
         lines.append("  embed_tokens ─── lm_head ─→ TIED ✓")
     else:
+        lines.append("    ▼")
         lines.append("  embed_tokens ─── lm_head ─→ independent")
     lines.append("    │")
-    lines.append("    ├─  ┌──────────────────────────────────────────────────────────┐")
-    lines.append(f"    │   │ ATTENTION (one of {layers} layers)                          │")
-    lines.append("    │   │")
-    lines.append("    ▼   │ pre-attention norm")
-    lines.append("    │   │   │")
-    lines.append("    │   │   ▼")
-
-    for key, value, note in _attn_decisions(quirks, config):
-        lines.append(f"    │   │   ├─ {key:<18} ──── {value:<24}   # {note}")
-
-    lines.append("    │   │")
-    lines.append("    │   │   └─→ output projection (o_proj)")
-    lines.append("    ▼   │      │")
-    lines.append("    │   │      └─ (residual add)")
-    lines.append("    │   │")
-    lines.append("    │   │ pre-mlp norm")
-    lines.append("    │   │   │")
-    lines.append("    │   │   ▼")
-
-    for key, value, note in _mlp_decisions(quirks, config, dry_run=dry_run):
-        lines.append(f"    │   │   ├─ {key:<18} ──── {value:<24}   # {note}")
-
-    lines.append("    │   │")
-    lines.append("    ▼   │   └─→ down_proj")
-    lines.append("    │   │      │")
-    lines.append("    │   │      └─ (residual add)")
-    lines.append("    │   │")
-    lines.append("    │   └──────────────────────────────────────────────────────────┘")
+    lines.append(f"    ├── × {layers} LAYER BLOCK{'S' if layers != 1 else ''} ─────────────────────────")
     lines.append("    │")
-    lines.append("    │ ×N layers")
+
+    # === Attention block ===
+    lines.append("    ▼")
+    lines.append("  ╭─ ATTENTION ──────────────────────────────────────────╮")
+    lines.append("  │")
+    lines.append("  │  pre-attention norm")
+    lines.append("  │    │")
+    for i, (key, value, note) in enumerate(_attn_decisions(quirks, config)):
+        is_last = i == len(_attn_decisions(quirks, config)) - 1
+        conn = "└─" if is_last else "├─"
+        lines.append(f"  │    {conn} {key:<18}  {value:<24}  # {note}")
+    lines.append("  │")
+    lines.append("  │    └─→ output projection (o_proj)")
+    lines.append("  │       │")
+    lines.append("  │       └─ (residual add)")
+    lines.append("  │")
+    lines.append("  ╰──────────────────────────────────────────────────────╯")
     lines.append("    │")
+
+    # === MLP block ===
+    lines.append("    ▼")
+    lines.append("  ╭─ MLP ────────────────────────────────────────────────╮")
+    lines.append("  │")
+    lines.append("  │  pre-mlp norm")
+    lines.append("  │    │")
+    mlp_dec = _mlp_decisions(quirks, config, dry_run=dry_run)
+    for i, (key, value, note) in enumerate(mlp_dec):
+        is_last = i == len(mlp_dec) - 1
+        conn = "└─" if is_last else "├─"
+        lines.append(f"  │    {conn} {key:<18}  {value:<24}  # {note}")
+    lines.append("  │")
+    lines.append("  │    └─→ down_proj")
+    lines.append("  │       │")
+    lines.append("  │       └─ (residual add)")
+    lines.append("  │")
+    lines.append("  ╰──────────────────────────────────────────────────────╯")
+    lines.append("    │")
+    lines.append("    │")
+
+    # === End of pipeline ===
     lines.append("    ▼")
     lines.append("  final_norm")
     for key, value, note in _norm_decisions(quirks, dry_run=dry_run):
         lines.append(f"    │   ({key}: {value})")
     lines.append("    │")
     lines.append("    ▼")
-    lines.append("  logits [vocab_size]")
+    lines.append(f"  logits [{vocab}]")
 
-    # KEY DECISIONS summary at the bottom
+    # === KEY DECISIONS summary ===
     decisions = []
     decisions.extend(_attn_decisions(quirks, config))
     decisions.extend(_mlp_decisions(quirks, config, dry_run=dry_run))
@@ -285,7 +310,7 @@ def render_graph_text(report: dict[str, Any]) -> str:
     lines.append("")
     lines.append("  KEY DECISIONS (for downstream tooling):")
     for key, value, note in decisions:
-        lines.append(f"    {value:<6} {key:<22} {note}")
+        lines.append(f"    {value:<18}  {key:<22}  {note}")
 
     # Memory math at the bottom
     if params and bytes_est:
@@ -481,6 +506,322 @@ def render_graph_compare(reports: list[dict[str, Any]]) -> str:
         lines.append("All models agree on every decision.")
 
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+
+def _decision_dicts(quirks: dict, config: dict, dry_run: bool) -> list[dict[str, Any]]:
+    """Convert a list of (key, value, note) tuples into structured dicts."""
+    out: list[dict[str, Any]] = []
+    for source in (_attn_decisions(quirks, config),
+                   _mlp_decisions(quirks, config, dry_run=dry_run),
+                   _norm_decisions(quirks, dry_run=dry_run),
+                   _global_decisions(config, quirks)):
+        for key, value, note in source:
+            out.append({"category": key, "verdict": value, "note": note})
+    return out
+
+
+def render_graph_json(report: dict[str, Any]) -> str:
+    """Single-model architecture decision graph as JSON.
+
+    Shape::
+
+        {
+            "model_id": "...",
+            "geometry": {...},       # head_line contents
+            "pipeline": [            # ordered stages
+                {"stage": "embed", "tied_embeddings": true},
+                {"stage": "layer_block", "count": 24, "decisions": [...]},
+                {"stage": "final_norm", "decisions": [...]},
+                {"stage": "logits", "shape": [...]}
+            ],
+            "decisions": [...]        # flat list of all decisions
+        }
+    """
+    import json as _json
+    config = report.get("config", {})
+    quirks = report.get("quirks", {})
+    mem = report.get("memory_estimate", {})
+    dry_run = bool(report.get("dry_run", False))
+
+    decisions = _decision_dicts(quirks, config, dry_run)
+    tied = bool(config.get("tie_word_embeddings", False))
+
+    pipeline = [
+        {"stage": "input", "description": "INPUT"},
+        {
+            "stage": "embed_tokens",
+            "tied_to_lm_head": tied,
+            "verdict": "TIED" if tied else "independent",
+        },
+        {
+            "stage": "layer_block",
+            "count": config.get("num_hidden_layers", "?"),
+            "decisions": [
+                d for d in decisions
+                if d["category"] in {
+                    "fused QKV", "MQA", "GQA", "attention bias", "rope_theta",
+                    "rope_scaling", "sliding_window", "MLP type", "fused gate/up",
+                }
+            ],
+        },
+        {
+            "stage": "final_norm",
+            "decisions": [
+                d for d in decisions if d["category"] == "Norm"
+            ],
+        },
+        {
+            "stage": "logits",
+            "vocab_size": config.get("vocab_size"),
+        },
+    ]
+
+    payload = {
+        "model_id": report.get("model_id", "<unknown>"),
+        "model_type": config.get("model_type", "unknown"),
+        "dry_run": dry_run,
+        "geometry": {
+            "num_hidden_layers": config.get("num_hidden_layers"),
+            "hidden_size": config.get("hidden_size"),
+            "num_attention_heads": config.get("num_attention_heads"),
+            "num_key_value_heads": config.get("num_key_value_heads"),
+            "intermediate_size": config.get("intermediate_size"),
+            "vocab_size": config.get("vocab_size"),
+            "torch_dtype": _clean_dtype(config.get("torch_dtype", "unknown")),
+        },
+        "memory": {
+            "estimated_params": mem.get("estimated_params"),
+            "estimated_bytes": mem.get("estimated_bytes"),
+            "dtype": mem.get("dtype"),
+        },
+        "pipeline": pipeline,
+        "decisions": decisions,
+    }
+    return _json.dumps(payload, indent=2, default=str) + "\n"
+
+
+def render_graph_compare_json(reports: list[dict[str, Any]]) -> str:
+    """N-way comparison graph as JSON.
+
+    Shape::
+
+        {
+            "comparison_type": "graph",
+            "model_count": N,
+            "models": ["a", "b", ...],
+            "decisions": [
+                {"category": "fused QKV", "values": {"a": "no", "b": "no"}, "all_same": true},
+                ...
+            ],
+            "differences": ["MQA / GQA", "Tied embeddings"]
+        }
+    """
+    import json as _json
+    if not reports:
+        return _json.dumps({"comparison_type": "graph", "model_count": 0, "models": [], "decisions": [], "differences": []}, indent=2) + "\n"
+    if len(reports) == 1:
+        return render_graph_json(reports[0])
+
+    # Build the same decision set per model
+    rows: dict[str, list[str]] = {}
+    for r in reports:
+        quirks = r.get("quirks", {})
+        config = r.get("config", {})
+        dry_run = bool(r.get("dry_run", False))
+        for d in _decision_dicts(quirks, config, dry_run):
+            rows.setdefault(d["category"], []).append(d["verdict"])
+
+    decisions_out = []
+    for category, vals in rows.items():
+        unique = list(dict.fromkeys(vals))  # preserve order, dedupe
+        decisions_out.append({
+            "category": category,
+            "values": {r.get("model_id", "?"): v for r, v in zip(reports, vals)},
+            "unique_values": unique,
+            "all_same": len(unique) == 1,
+        })
+
+    differences = [
+        d["category"] for d in decisions_out if not d["all_same"]
+    ]
+
+    payload = {
+        "comparison_type": "graph",
+        "model_count": len(reports),
+        "models": [r.get("model_id", "?") for r in reports],
+        "decisions": decisions_out,
+        "differences": differences,
+        "all_identical": not differences,
+    }
+    return _json.dumps(payload, indent=2, default=str) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Markdown output
+# ---------------------------------------------------------------------------
+
+def render_graph_markdown(report: dict[str, Any]) -> str:
+    """Single-model architecture decision graph as Markdown."""
+    config = report.get("config", {})
+    quirks = report.get("quirks", {})
+    mem = report.get("memory_estimate", {})
+    dry_run = bool(report.get("dry_run", False))
+
+    layers = config.get("num_hidden_layers", "?")
+    hidden = config.get("hidden_size", "?")
+    n_heads = config.get("num_attention_heads", "?")
+    n_kv = config.get("num_key_value_heads", n_heads)
+    inter = config.get("intermediate_size", "?")
+    vocab = config.get("vocab_size", "?")
+    dtype = _clean_dtype(config.get("torch_dtype", "unknown"))
+    tied = bool(config.get("tie_word_embeddings", False))
+    params = mem.get("estimated_params")
+    bytes_est = mem.get("estimated_bytes")
+
+    out: list[str] = []
+    out.append(f"# `{report.get('model_id', '<unknown>')}` — architecture graph")
+    out.append("")
+    out.append(
+        f"**Geometry:** {layers} layers, hidden={hidden}, heads={n_heads} (kv:{n_kv}), "
+        f"ffn={inter}, vocab={vocab}, dtype={dtype}"
+    )
+    if params:
+        out.append(
+            f"**Memory:** {_fmt_bytes(bytes_est)} @ {mem.get('dtype', dtype)} "
+            f"({_fmt_params(params)} params)"
+        )
+    out.append("")
+    out.append("## Pipeline")
+    out.append("")
+    out.append(f"1. **INPUT** → embed_tokens")
+    out.append(f"2. embed_tokens → lm_head → {'TIED ✓' if tied else 'independent'}")
+    out.append(f"3. × {layers} layer block:")
+    out.append("    - **Attention** (with pre-attention norm + residual)")
+    out.append("    - **MLP** (with pre-mlp norm + residual)")
+    out.append("4. final_norm")
+    out.append(f"5. logits [vocab={vocab}]")
+    out.append("")
+
+    out.append("## Architectural decisions")
+    out.append("")
+    decisions = _decision_dicts(quirks, config, dry_run)
+    if decisions:
+        out.append("| Category | Verdict | Note |")
+        out.append("|----------|---------|------|")
+        for d in decisions:
+            out.append(f"| {d['category']} | `{d['verdict']}` | {d['note']} |")
+    out.append("")
+
+    out.append("## Downstream tooling notes")
+    out.append("")
+    for d in decisions:
+        if d["verdict"] in ("YES", "no"):
+            mark = "✓" if d["verdict"] == "YES" else "✗"
+            out.append(f"- {mark} **{d['category']}** — {d['note']}")
+        else:
+            out.append(f"- **{d['category']}** = `{d['verdict']}` — {d['note']}")
+    out.append("")
+
+    if bytes_est and params:
+        int8 = int(bytes_est // 2)
+        int4 = int(bytes_est // 4)
+        out.append("## Memory estimates")
+        out.append("")
+        out.append(f"- **{mem.get('dtype', dtype)}**: {_fmt_bytes(bytes_est)}")
+        out.append(f"- **int8**: {_fmt_bytes(int8)}")
+        out.append(f"- **int4**: {_fmt_bytes(int4)}")
+        out.append("")
+
+    return "\n".join(out) + "\n"
+
+
+def render_graph_compare_markdown(reports: list[dict[str, Any]]) -> str:
+    """N-way comparison graph as Markdown."""
+    if not reports:
+        return "# (no models)\n"
+    if len(reports) == 1:
+        return render_graph_markdown(reports[0])
+
+    out: list[str] = []
+    out.append("# Architecture decision comparison")
+    out.append("")
+    out.append(f"**{len(reports)} models:** {', '.join(r.get('model_id', '?') for r in reports)}")
+    out.append("")
+
+    # Build decisions table
+    rows: dict[str, list[str]] = {}
+    for r in reports:
+        quirks = r.get("quirks", {})
+        config = r.get("config", {})
+        dry_run = bool(r.get("dry_run", False))
+        for d in _decision_dicts(quirks, config, dry_run):
+            rows.setdefault(d["category"], []).append(d["verdict"])
+
+    if rows:
+        out.append("## Decisions")
+        out.append("")
+        # Markdown table header
+        cols = [r.get("model_id", "?") for r in reports]
+        out.append("| Category | " + " | ".join(cols) + " |")
+        out.append("|" + "|".join(["---"] * (len(cols) + 1)) + "|")
+        differences = []
+        for category, vals in rows.items():
+            unique = list(dict.fromkeys(vals))
+            all_same = len(unique) == 1
+            row_cells = []
+            for v in vals:
+                mark = "**" if not all_same else ""
+                row_cells.append(f"{mark}{v}{mark}" if not all_same else v)
+            out.append(f"| {category} | " + " | ".join(row_cells) + " |")
+            if not all_same:
+                differences.append(category)
+        out.append("")
+
+    # Geometry comparison
+    geom_rows = [
+        ("hidden_size", lambda c: str(c.get("hidden_size", "?"))),
+        ("num_layers", lambda c: str(c.get("num_hidden_layers", "?"))),
+        ("num_attention_heads", lambda c: str(c.get("num_attention_heads", "?"))),
+        ("num_kv_heads", lambda c: str(c.get("num_key_value_heads", "?"))),
+        ("vocab_size", lambda c: str(c.get("vocab_size", "?"))),
+        ("dtype", lambda c: _clean_dtype(c.get("torch_dtype", "?"))),
+    ]
+    out.append("## Geometry")
+    out.append("")
+    cols = [r.get("model_id", "?") for r in reports]
+    out.append("| Field | " + " | ".join(cols) + " |")
+    out.append("|" + "|".join(["---"] * (len(cols) + 1)) + "|")
+    for label, getter in geom_rows:
+        vals = [getter(r.get("config", {})) for r in reports]
+        unique = list(dict.fromkeys(vals))
+        all_same = len(unique) == 1
+        cells = []
+        for v in vals:
+            cells.append(v if all_same else f"**{v}**")
+        out.append(f"| {label} | " + " | ".join(cells) + " |")
+    # Memory
+    mem_vals = [_fmt_bytes((r.get("memory_estimate") or {}).get("estimated_bytes")) for r in reports]
+    unique = list(dict.fromkeys(mem_vals))
+    all_same = len(unique) == 1
+    cells = [v if all_same else f"**{v}**" for v in mem_vals]
+    out.append("| memory @ bf16 | " + " | ".join(cells) + " |")
+    out.append("")
+
+    # Differ footer
+    if differences:
+        if len(differences) <= 5:
+            out.append(f"**Differ across {len(reports)} models:** {', '.join(differences)}")
+        else:
+            out.append(f"**Differ across {len(reports)} models:** {', '.join(differences[:5])}…")
+    else:
+        out.append("**All models agree on every decision.**")
+    out.append("")
+
+    return "\n".join(out) + "\n"
 
 
 def _yesno(b: bool | None) -> str:
