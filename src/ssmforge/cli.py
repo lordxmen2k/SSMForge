@@ -290,22 +290,67 @@ def _check_output_path(output_path: str | None) -> tuple[Path | None, str | None
     - ``(parent_dir, None)`` when the directory exists and is writable.
     - ``(parent_dir, error_message)`` when the path can't be written.
 
-    The error_message is a user-friendly hint that names the actual problem
-    (missing parent dir, not a directory, permission denied) and suggests
-    writable alternatives when appropriate.
+    Detects two common Windows-MINGW64 traps:
+    1. Literal backslash paths (`C:\\file.md` unquoted) — POSIX `Path`
+       treats them as single-component filenames. Hint: quote it.
+    2. Bash-mangled paths (`C:UsersnetgeDesktop.md`) — when Git Bash
+       strips backslashes from an unquoted argument, the resulting
+       string looks like a Windows drive path with no separators. Hint:
+       quote the argument or use forward slashes.
     """
     if not output_path or output_path == "-":
         return None, None
-    p = Path(output_path)
-    parent = p.parent if str(p.parent) else Path(".")
-    # Catch a bare filename like 'report.md' (parent is '.') which DOES work
-    parent = parent.resolve()
+
+    raw = output_path
+    bs = chr(92)
+    fs = "/"
+
+    # Trap 1: Literal backslashes without forward slashes — POSIX `Path`
+    # will treat this as a single filename, not a path.
+    if bs in raw and fs not in raw:
+        return None, (
+            f"Error: output path uses backslashes without forward slashes.\n"
+            f"  Got: {raw!r}\n"
+            f"  On Git Bash + Windows, backslash paths must be quoted:\n"
+            f"    --output \"{raw}\"     # wrap in double quotes\n"
+            f"  Or use forward slashes (work on both Windows and POSIX):\n"
+            f"    --output {raw.replace(bs, fs)}"
+        )
+
+    # Trap 2: Bash-mangled Windows path — `C:` followed by a sequence of
+    # identifiers concatenated without separators. Real Windows paths
+    # always contain separators between components.
+    if (
+        len(raw) >= 3
+        and raw[1] == ":"
+        and raw[0].isalpha()
+        and fs not in raw
+        and bs not in raw
+        and len(raw) > 2
+    ):
+        # Looks like `C:UsersnetgeDesktop` (bash mangled) instead of
+        # `C:/Users/netge/Desktop` (real path).
+        return None, (
+            f"Error: output path looks like a Windows path with all separators stripped.\n"
+            f"  Got: {raw!r}\n"
+            f"  Git Bash strips backslashes from unquoted arguments. Wrap in quotes:\n"
+            f"    --output \"C:{bs}Users{bs}netge{bs}Desktop{bs}report.md\"\n"
+            f"  Or use forward slashes (POSIX-style, works on Windows):\n"
+            f"    --output C:/Users/netge/Desktop/report.md"
+        )
+
+    # Use os.path for parent resolution to match what write_text will do.
+    abs_target = os.path.abspath(raw)
+    parent_str = os.path.dirname(abs_target) or "."
+    parent = Path(parent_str)
+
     # Case 1: parent doesn't exist
     if not parent.exists():
         return parent, (
             f"Error: output directory does not exist: {parent}\n"
             f"  Hint: create the directory first, or use a writable location.\n"
-            f"  Try: --output ./report.md  (current working directory)"
+            f"  Try: --output ./report.md  (current working directory)\n"
+            f"       --output ~/report.md  (your home directory)"
         )
     # Case 2: parent exists but is a file (not a dir)
     if parent.is_file():
@@ -325,12 +370,105 @@ def _check_output_path(output_path: str | None) -> tuple[Path | None, str | None
     return parent, None
 
 
+def _looks_like_bash_mangled_path(value: str) -> bool:
+    """Detect a string that's likely been mangled by Git Bash.
+
+    Patterns detected:
+    - Drive letter + no separators: 'C:UsersnetgeDesktop.md'
+    - Drive letter + backslashes only: 'C:\\\\Users\\\\...'
+
+    Returns True if the value looks like a Windows path whose separators
+    have been stripped. Returns False for plain POSIX paths or quoted
+    Windows paths (which contain forward slashes or backslashes that
+    survived quoting).
+    """
+    if len(value) < 3:
+        return False
+    # Must start with drive letter + colon
+    if not (value[0].isalpha() and value[1] == ":"):
+        return False
+    # Must have no separators (the mangling signature)
+    if "/" in value or "\\" in value:
+        return False
+    # Drive + filename only (`C:foo.md`) is ambiguous on Windows and
+    # almost certainly unintended — flag it.
+    return True
+
+
+def _pre_parse_path_guard(argv: list[str]) -> None:
+    """Pre-parse guard: detect bash-mangled --output values BEFORE argparse.
+
+    Runs before argparse consumes the args. If `--output VALUE` has a
+    mangled VALUE, prints a clear error and exits 1 — so the user sees
+    the issue immediately rather than after the model loads.
+
+    Also detects bare backslash paths (with backslashes intact) which
+    POSIX Python interprets as literal filenames.
+    """
+    bs = chr(92)
+    fs = "/"
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        # --output VALUE (separate args)
+        if arg == "--output" or arg == "-o":
+            if i + 1 < len(argv):
+                value = argv[i + 1]
+                if _looks_like_bash_mangled_path(value):
+                    print(
+                        f"Error: --output value looks like a bash-mangled Windows path.\n"
+                        f"  Got: {value!r}\n"
+                        f"  Git Bash strips backslashes from unquoted arguments.\n"
+                        f"  Wrap the value in double quotes, e.g.:\n"
+                        f"    --output \"C:{bs}Users{bs}netge{bs}Desktop{bs}report.md\"\n"
+                        f"  Or use forward slashes (works on both Windows and POSIX):\n"
+                        f"    --output C:/Users/netge/Desktop/report.md",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if bs in value and fs not in value:
+                    print(
+                        f"Error: --output uses backslashes without forward slashes.\n"
+                        f"  Got: {value!r}\n"
+                        f"  Wrap in double quotes:\n"
+                        f"    --output \"{value}\"\n"
+                        f"  Or use forward slashes:\n"
+                        f"    --output {value.replace(bs, fs)}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            i += 2
+            continue
+        # --output=VALUE (combined) or --output=anything
+        if arg.startswith("--output=") or arg.startswith("-o="):
+            value = arg.split("=", 1)[1]
+            if _looks_like_bash_mangled_path(value):
+                print(
+                    f"Error: --output value looks like a bash-mangled Windows path.\n"
+                    f"  Got: {value!r}\n"
+                    f"  Wrap the value in double quotes or use forward slashes.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if bs in value and fs not in value:
+                print(
+                    f"Error: --output uses backslashes without forward slashes.\n"
+                    f"  Got: {value!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        i += 1
+
+
 def _write_or_print(text: str, output_path: str | None) -> None:
     """Write text to a file if path given, else print to stdout.
 
     Special-case: if output_path is '-', print to stdout (Unix convention).
     Pre-flight checks the parent directory exists and is writable; on
     failure prints a friendly hint and exits 1.
+    After writing, verifies the file exists on disk (defends against
+    silently-successful-to-nowhere writes on Windows MINGW64 where
+    backslash paths can be misinterpreted as relative filenames).
     """
     if output_path and output_path != "-":
         parent, err = _check_output_path(output_path)
@@ -347,7 +485,30 @@ def _write_or_print(text: str, output_path: str | None) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        print(f"Report written to {output_path}", file=sys.stderr)
+        # Post-write verification: catch the case where Python writes to a
+        # path on disk that the user didn't intend (e.g., a literal
+        # 'C:\nope.md' filename in the current directory on POSIX).
+        resolved = p.resolve()
+        if not resolved.exists():
+            print(
+                f"Error: write appeared to succeed but file not found.\n"
+                f"  Target: {resolved}\n"
+                f"  Hint: try a relative path like --output ./report.md",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # If the user gave a Windows-style absolute path with backslashes
+        # but it landed in the current directory as a literal filename,
+        # warn them.
+        bs = chr(92)
+        if bs in str(output_path) and "/" not in str(output_path) and resolved.parent == Path(".").resolve():
+            print(
+                f"Warning: wrote to a literal filename {resolved!r}\n"
+                f"  Did you mean a Windows-style path? On Git Bash + Windows,\n"
+                f"  use forward slashes: --output {str(output_path).replace(bs, '/')}",
+                file=sys.stderr,
+            )
+        print(f"Report written to {resolved}", file=sys.stderr)
     else:
         print(text)
 
@@ -655,6 +816,13 @@ def main(argv: list[str] | None = None) -> None:
              "print the result. Exits non-zero if anything is wrong so you "
              "can use it in scripts.",
     )
+
+    # Pre-parse guard: catch common path-mangling issues from Git Bash on
+    # Windows BEFORE argparse consumes the args. Without this, an unquoted
+    # `--output C:\Users\foo\out.md` becomes `C:Usersfooout.md` after bash
+    # strips the backslashes, then argparse accepts the garbage silently.
+    if argv:
+        _pre_parse_path_guard(argv)
 
     args = parser.parse_args(argv)
 

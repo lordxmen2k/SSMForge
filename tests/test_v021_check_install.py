@@ -370,3 +370,150 @@ def test_write_or_print_rejects_unwritable_directory(tmp_path, capsys):
             pass
     finally:
         ro_dir.chmod(stat.S_IRWXU)
+
+
+# ---------- v0.2.2: backslash path detection (Git Bash on Windows trap) ----------
+
+def test_check_output_path_backslash_only_warns(monkeypatch, capsys):
+    """Input like 'C:\\\\nope.md' on POSIX gets caught with a backslash hint.
+
+    Regression: v0.2.2 first attempt didn't catch this case because
+    os.path.abspath silently converts it to a single-component path,
+    whose parent ('.') always exists and is always writable.
+    """
+    from ssmforge.cli import _check_output_path
+    # The literal backslash path that Git Bash on Windows passes through
+    monkeypatch.setattr("sys.platform", "linux")  # simulate POSIX
+    parent, err = _check_output_path(r"C:\nope.md")
+    assert err is not None
+    assert "backslashes" in err
+    # Suggested fix is in the hint
+    assert "/" in err  # forwarded-slash version mentioned
+
+
+def test_check_output_path_forward_slash_not_flagged(monkeypatch, tmp_path):
+    """'C:/nope.md' is treated as a real (Windows-on-POSIX) path;
+    it's flagged as a non-existent directory, NOT a backslash issue."""
+    from ssmforge.cli import _check_output_path
+    monkeypatch.setattr("sys.platform", "linux")
+    parent, err = _check_output_path("C:/nope.md")
+    assert err is not None
+    assert "backslashes" not in err  # not the backslash issue
+    assert "does not exist" in err  # dir doesn't exist
+
+
+def test_write_or_print_catches_written_to_wrong_path(monkeypatch, tmp_path, capsys):
+    """If write_text 'succeeds' to a literal filename but the user's intent
+    was different (e.g., they meant a Windows path), warn after writing.
+
+    We simulate by using a path the user gave as 'C:\\\\nope.md' which
+    on POSIX becomes a single literal filename in cwd.
+    """
+    from ssmforge.cli import _write_or_print
+    monkeypatch.setattr("sys.platform", "linux")
+    # The first call catches the backslash-as-filename issue via pre-check.
+    # So _write_or_print fails the pre-check.
+    bs = chr(92)
+    with pytest.raises(SystemExit) as exc:
+        _write_or_print("test", f"C:{bs}nope.md")
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "backslashes" in captured.err
+
+
+# ---------- v0.2.3: bash-mangled Windows path detection ----------
+
+def test_check_output_path_bash_mangled_windows_path():
+    """`C:UsersnetgeDesktop.md` (no separators) is detected as a bash-mangled
+    Windows path. The fix in v0.2.2 caught backslash-only paths but missed
+    this case where bash already stripped them.
+    """
+    from ssmforge.cli import _check_output_path
+    parent, err = _check_output_path("C:UsersnetgeDesktopNope.md")
+    assert err is not None
+    assert "separators stripped" in err or "Git Bash strips" in err
+    # Hint should mention quoting
+    assert "quotes" in err or "wrap" in err.lower()
+
+
+def test_check_output_path_bash_mangled_keeps_short_drive_only():
+    """`C:report.md` is also caught — drive letter with no path separators
+    is ambiguous on Windows (drive-relative vs absolute). Better to ask
+    the user to disambiguate than silently write to the wrong place.
+    """
+    from ssmforge.cli import _check_output_path
+    parent, err = _check_output_path("C:report.md")
+    assert err is not None
+    # Either "bash mangled" or "backslashes" — both are valid catches
+    assert ("separators stripped" in err or "backslashes" in err)
+
+
+def test_write_or_print_catches_bash_mangled(monkeypatch, capsys):
+    """End-to-end: when user passes a bash-mangled Windows path,
+    the CLI rejects it before silently writing to cwd."""
+    from ssmforge.cli import _write_or_print
+    # The actual case from the bug report
+    with pytest.raises(SystemExit) as exc:
+        _write_or_print("test content", "C:UsersnetgeOneDriveDesktopNope.md")
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "separators stripped" in captured.err
+
+
+# ---------- v0.2.3: pre-parse guard for bash-mangled --output ----------
+
+def test_pre_parse_guard_bash_mangled_path_separate_args(capsys):
+    """`--output C:Users...` (separate args) is caught BEFORE argparse runs."""
+    from ssmforge.cli import _pre_parse_path_guard
+    with pytest.raises(SystemExit) as exc:
+        _pre_parse_path_guard(["arch", "X", "--dry-run", "--output", "C:UsersnetgeDesktop.md"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "bash-mangled" in captured.err
+    assert "C:UsersnetgeDesktop.md" in captured.err
+
+
+def test_pre_parse_guard_bash_mangled_path_equals_form(capsys):
+    """`--output=C:Users...` (equals form) is also caught."""
+    from ssmforge.cli import _pre_parse_path_guard
+    with pytest.raises(SystemExit):
+        _pre_parse_path_guard(["arch", "X", "--output=C:UsersnetgeDesktop.md"])
+    captured = capsys.readouterr()
+    assert "bash-mangled" in captured.err
+
+
+def test_pre_parse_guard_backslash_only(capsys):
+    """Literal backslash path (no forward slashes) caught."""
+    from ssmforge.cli import _pre_parse_path_guard
+    bs = chr(92)
+    with pytest.raises(SystemExit):
+        _pre_parse_path_guard(["arch", "X", "--output", f"C:{bs}Users{bs}netge{bs}Desktop.md"])
+    captured = capsys.readouterr()
+    assert "backslashes" in captured.err or "quotes" in captured.err
+
+
+def test_pre_parse_guard_accepts_posix_paths():
+    """Plain POSIX paths pass through without error."""
+    from ssmforge.cli import _pre_parse_path_guard
+    # Should not raise SystemExit
+    _pre_parse_path_guard(["arch", "X", "--output", "./report.md"])
+    _pre_parse_path_guard(["arch", "X", "--output", "/tmp/report.md"])
+    _pre_parse_path_guard(["arch", "X", "--output", "report.md"])
+
+
+def test_pre_parse_guard_accepts_quoted_windows_path_with_forward_slashes():
+    """`C:/Users/...` (forward slashes) is fine — works on Windows + POSIX."""
+    from ssmforge.cli import _pre_parse_path_guard
+    # Should not raise SystemExit
+    _pre_parse_path_guard(["arch", "X", "--output", "C:/Users/netge/Desktop/report.md"])
+
+
+def test_pre_parse_guard_accepts_bare_drive_filename():
+    """`C:report.md` — drive letter + filename only — is caught as ambiguous.
+
+    Even though it could legitimately mean "C: drive, relative file",
+    this is almost always a sign of bash mangling. Better to error.
+    """
+    from ssmforge.cli import _pre_parse_path_guard
+    with pytest.raises(SystemExit):
+        _pre_parse_path_guard(["arch", "X", "--output", "C:report.md"])

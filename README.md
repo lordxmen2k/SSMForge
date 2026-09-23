@@ -59,6 +59,28 @@ visible *before* you spend the next hour finding out the hard way.
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
 
+### What's new in 0.2.3
+
+| Fix | What was broken |
+|-----|-----------------|
+| `--output` on Git Bash + Windows with unquoted backslash paths | Git Bash strips backslashes from unquoted args, so `--output C:\Users\foo\out.md` reached Python as `C:Usersfooout.md` — silently writing a single literal-named file in the cwd. Pre-parse guard now catches this BEFORE argparse runs and exits 1 with a clear "wrap in double quotes or use forward slashes" hint. |
+| `C:Usersnetge...` (bash-mangled, no separators) detected | The post-write `_check_output_path` was too late. The pre-parse guard catches the mangled pattern early and tells you exactly what bash did to your argument. |
+
+**Quote your paths from now on.** Or use forward slashes — they work on both Windows and POSIX.
+
+```bash
+# ✅ Recommended — works everywhere
+python -m ssmforge.cli arch X --graph --format markdown --output ~/Desktop/report.md
+python -m ssmforge.cli arch X --graph --format markdown --output ./report.md
+python -m ssmforge.cli arch X --graph --format markdown --output "C:/Users/me/Desktop/report.md"
+
+# ❌ These will now fail with a clear error:
+python -m ssmforge.cli arch X --graph --format markdown --output C:\Users\me\Desktop\report.md
+python -m ssmforge.cli arch X --graph --format markdown --output C:UsersmeDesktopreport.md
+```
+
+Plus 9 new tests (174 total).
+
 ### What's new in 0.2.2
 
 | Fix | What was broken |
@@ -1377,7 +1399,55 @@ install.
 
 ## 16. Update log
 
-### v0.2.2 (current) — 2026-09-23
+### v0.2.3 (current) — 2026-09-23
+
+**Bug fix: Git Bash strips backslashes from unquoted `--output` args**
+
+When you run on Git Bash + Windows and pass an unquoted Windows path:
+```bash
+python -m ssmforge.cli arch X --graph --format markdown \
+    --output C:\Users\netge\Desktop\report.md
+```
+
+Git Bash sees the backslashes as path separators and strips them
+**before** passing the argument to Python. Python receives:
+```
+--output C:UsersnetgeDesktopreport.md
+```
+which is interpreted as a single literal filename containing no
+separators. The CLI then writes a file named
+`./C:UsersnetgeDesktopreport.md` in the current directory — totally
+wrong, and v0.2.2 didn't catch it.
+
+**v0.2.3 fixes this with a pre-parse guard** that runs before argparse
+and checks for:
+
+1. **Literal backslash paths** (`C:\\file.md`) — caught with hint to
+   use forward slashes or wrap in quotes.
+2. **Bash-mangled paths** (`C:UsersnetgeDesktop.md`) — caught with
+   hint explaining what bash did to the argument.
+
+The error fires immediately, before any model is loaded:
+
+```
+Error: --output value looks like a bash-mangled Windows path.
+  Got: 'C:UsersnetgeDesktopreport.md'
+  Git Bash strips backslashes from unquoted arguments.
+  Wrap the value in double quotes, e.g.:
+    --output "C:\Users\netge\Desktop\report.md"
+  Or use forward slashes (works on both Windows and POSIX):
+    --output C:/Users/netge/Desktop/report.md
+```
+
+**Recommended from v0.2.3 onward:** quote all `--output` paths, or
+use forward slashes.
+
+Tests: 174 passed (was 165). 9 new tests for the pre-parse guard
+covering bash-mangled separate-args, bash-mangled equals-form,
+backslash-only paths, plain POSIX paths, forward-slash Windows paths,
+and bare drive-letter patterns.
+
+### v0.2.2 — 2026-09-23
 
 **Bug fix: `--output PATH` directory validation**
 
