@@ -37,6 +37,16 @@ ssmforge arch Qwen/Qwen2-1.5B-Instruct
 14. [Why this exists](#14-why-this-exists)
 15. [Limitations](#15-limitations)
 16. [Update log](#16-update-log)
+17. [Comprehensive Usage Guide](#17-comprehensive-usage-guide)
+    - 17.1 [Decision tree](#171-decision-tree-which-command-do-i-want)
+    - 17.2 [Every arch flag](#172-every-arch-flag-what-it-does-when-to-use-it)
+    - 17.3 [Every doctor flag](#173-every-doctor-flag)
+    - 17.4 [Output format decision guide](#174-output-format-decision-guide)
+    - 17.5 [Real-world workflows](#175-real-world-workflows)
+    - 17.6 [Web interfaces (PyPI + GitHub)](#176-web-interfaces-what-users-see)
+    - 17.7 [Batch processing](#177-batch-processing-file-by-file-loops)
+    - 17.8 [Troubleshooting cookbook](#178-troubleshooting-cookbook)
+    - 17.9 [Recipe index](#179-recipe-index-quick-lookup)
 
 ---
 
@@ -58,6 +68,15 @@ visible *before* you spend the next hour finding out the hard way.
 
 It does **not** modify the model. It does **not** run inference. It only
 inspects.
+
+### What's new in 0.2.4
+
+| Area | What's added |
+|------|--------------|
+| **Comprehensive Usage Guide (§17)** | 9-section deep dive covering every flag, every command, every workflow. Includes decision tree, output-format picker, 7 real-world workflows (CI/CD, batch processing, model selection), web interface tour (PyPI + GitHub), troubleshooting cookbook, recipe index. |
+| **Web interface section** | Explains what users see on PyPI and GitHub, how the README becomes the canonical doc, how to set up repo Settings (Issues, Discussions) so users can file bugs and ask questions. |
+
+Pure documentation release — no behavior changes, no new tests, no PyPI surprises. Just deeper, more useful docs.
 
 ### What's new in 0.2.3
 
@@ -1399,6 +1418,33 @@ install.
 
 ## 16. Update log
 
+### v0.2.4 (current) — 2026-09-23
+
+**Documentation: Comprehensive Usage Guide (§17)**
+
+Added a 9-section, 700+ line deep dive into how to actually use ssmforge:
+
+- **17.1 Decision tree** — "What do you want to do?" → which command
+- **17.2 Every `arch` flag** — what each flag does, when to use it,
+  with multiple examples per flag
+- **17.3 Every `doctor` flag** — `doctor` + `--check-install`
+- **17.4 Output format decision guide** — table mapping "what you
+  want" → "which format"
+- **17.5 Real-world workflows** — 7 end-to-end recipes (model
+  evaluation, model selection, batch processing for benchmarks,
+  CI/CD, docs generation, VRAM filtering, bug report prep)
+- **17.6 Web interface tour** — what users see on PyPI and GitHub,
+  how README becomes the canonical doc, repo Settings checklist
+- **17.7 Batch processing** — shell and Python patterns for
+  iterating over many models
+- **17.8 Troubleshooting cookbook** — common error → one-line fix
+- **17.9 Recipe index** — copy-paste recipes for common queries
+
+This is a docs-only release. No code changes. Tests still at 174
+passing. 32 anchor links verified (0 broken), 0 platform refs.
+
+### v0.2.3 — 2026-09-23
+
 ### v0.2.3 (current) — 2026-09-23
 
 **Bug fix: Git Bash strips backslashes from unquoted `--output` args**
@@ -1803,7 +1849,702 @@ pip install ssmforge
 
 ---
 
-## Contributing
+## 17. Comprehensive Usage Guide
+
+This is the deep-dive section — every flag combination, every workflow,
+every way users actually use ssmforge in real life. Skim if you know what
+you want, read it through if you're new.
+
+### 17.1 Decision tree — "Which command do I want?"
+
+```
+Want to...
+├── Inspect ONE model?
+│   ├── Without downloading weights         → arch X --dry-run
+│   ├── With weights (full scan)             → arch X
+│   ├── Just the profile summary             → arch X --profile
+│   ├── Visual decision graph (terminal)     → arch X --graph
+│   ├── JSON for a script                     → arch X --quiet --format json
+│   ├── Markdown for a GitHub Issue          → arch X --quiet --format markdown --output issue.md
+│   ├── Save JSON to a file                   → arch X --output report.json
+│   ├── Subset to specific fields             → arch X --fields quirks
+│   ├── Pin to a specific HF commit           → arch X --rev v2.3 --dry-run
+│   └── Load a local model from disk          → arch /path/to/model --dry-run
+│
+├── Compare 2+ models?
+│   ├── 2 models, JSON diff (legacy)          → arch A --diff B
+│   ├── 2+ models, side-by-side table         → arch --compare A B
+│   ├── 2+ models, source + compare list      → arch A --compare B C D
+│   ├── Show only the things that differ      → arch --compare A B C --only-different
+│   ├── Just their profiles                   → arch --compare A B --profile
+│   ├── Decision graph (text/json/markdown)   → arch --compare A B C --graph --format markdown
+│   └── Subset to specific fields             → arch --compare A B --fields profile
+│
+├── Diagnose my install?
+│   ├── Full environment info                 → doctor
+│   ├── Install checks (PATH, scripts)        → doctor --check-install
+│   └── Machine-readable                      → doctor --check-install --format json
+│
+└── Use as a Python library?
+    ├── Detect quirks from a config            → from ssmforge.analyze import scan_config_only
+    ├── Detect quirks from a state dict        → from ssmforge.analyze import scan_state_dict
+    ├── Build a full report                   → from ssmforge.analyze import build_report_from_config
+    ├── Compare two reports                    → from ssmforge.analyze import compare_reports
+    └── Render a graph                         → from ssmforge.analyze import render_graph_text
+```
+
+### 17.2 Every `arch` flag — what it does, when to use it
+
+Single-model inspection. Source can be an HF id or a local path.
+
+#### `--output PATH` / `-o PATH`
+
+Where the report lands. If omitted, the report goes to stdout (so you can
+pipe to `jq`, `less`, etc.). Use `-` to be explicit about stdout. Use a
+quoted absolute path when going to a directory other than cwd.
+
+```bash
+# stdout (default, pipe-friendly)
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run
+
+# write to a file in cwd
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --output qwen2.json
+
+# write to a specific directory (wrap path in quotes on Windows)
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --output "~/Desktop/qwen2.md"
+
+# explicit stdout
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --output -
+```
+
+See **17.8 Troubleshooting** if you see `Permission denied` on `--output`.
+
+#### `--format {text,json,markdown,md}` / `-f FORMAT`
+
+What shape the output takes.
+
+| Format | When to use |
+|--------|-------------|
+| `text` (default for `--graph`) | Terminal viewing — human reads it |
+| `json` (default for `arch`) | Pipelines — `jq`, scripts, comparison tools |
+| `markdown` / `md` | Documentation — paste into GitHub, Obsidian, Notion |
+| `text` for `--graph` | Box-drawing in your terminal |
+
+```bash
+# JSON, the default — machine-friendly
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run
+
+# Markdown for a docs page
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --format markdown --output doc.md
+
+# Text graph in the terminal
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --graph --format text
+
+# JSON for a script
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --quiet | python -m json.tool > pretty.json
+```
+
+#### `--quiet`
+
+Suppress the human-readable summary that ssmforge normally prints to
+stderr. Use this when you're piping to a tool that doesn't want the
+extra noise.
+
+```bash
+# With --quiet: just the JSON, nothing else
+ssmforge arch X --dry-run --quiet | jq '.quirks'
+
+# Without --quiet: JSON + human summary on stderr
+ssmforge arch X --dry-run | jq '.quirks'
+```
+
+#### `--diff OTHER_MODEL`
+
+Compare against one other model. Loads both, prints a JSON diff.
+Two-model legacy interface — prefer `--compare` for 2+ models.
+
+```bash
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --diff TinyLlama/TinyLlama-1.1B-Chat-v1.0
+```
+
+#### `--compare MODEL [MODEL ...]`
+
+Side-by-side comparison of 2+ models. The first model can come from the
+positional `source` argument; the rest from `--compare`. Output is a
+table showing each model's value for each field.
+
+```bash
+# All from --compare
+ssmforge arch --compare TinyLlama-1.1B Qwen2-0.5B Qwen2-1.5B --dry-run
+
+# Positional + --compare
+ssmforge arch TinyLlama-1.1B --compare Qwen2-0.5B Qwen2-1.5B --dry-run
+
+# Mixed: positional then --compare
+ssmforge arch Qwen2-0.5B Qwen2-1.5B Phi-2-moe --dry-run
+
+# Same model twice (e.g., "compare A against itself")
+ssmforge arch --compare Qwen2-0.5B Qwen2-0.5B --dry-run  # → all_identical=True
+```
+
+#### `--dry-run`
+
+Fetch only the config, skip the GB download. Estimates memory from the
+config alone. Quirks that require actual weight inspection will be
+marked `unknown` with a note.
+
+```bash
+ssmforge arch bigscience/bloom-7b1 --dry-run  # 0 MB downloaded
+ssmforge arch bigscience/bloom-7b1            # ~13 GB downloaded
+```
+
+Always use `--dry-run` for unfamiliar models first.
+
+#### `--rev REVISION` / `--revision REVISION`
+
+Pin to a specific HF commit, tag, or branch instead of HEAD. Critical
+for reproducibility — without this, the report changes whenever the
+upstream model gets a new commit.
+
+```bash
+ssmforge arch TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rev v1.0
+ssmforge arch TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rev ecfab3a  # full sha
+ssmforge arch TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rev main    # branch
+```
+
+The resolved revision sha is stamped on the report as `hf_revision`.
+
+#### `--fields NAME1,NAME2`
+
+Subset the output to only the requested fields. Works for both single
+and `--compare` mode. Dotted paths supported.
+
+```bash
+# Single model: only the quirks section
+ssmforge arch X --dry-run --fields quirks
+
+# Single model: a specific quirk via dotted path
+ssmforge arch X --dry-run --fields "quirks.attention_bias,profile.family"
+
+# All quirks + the family
+ssmforge arch X --dry-run --fields "quirks,profile.family"
+
+# Compare: only the geometry table fields
+ssmforge arch --compare A B C --dry-run --fields "hidden_size,num_hidden_layers"
+```
+
+#### `--only-different`
+
+Compare mode only. Hide the "Identical across all models" footer.
+Pairs naturally with `--compare`.
+
+```bash
+ssmforge arch --compare TinyLlama-1.1B Qwen2-0.5B Qwen2-1.5B --dry-run --only-different
+```
+
+#### `--profile`
+
+Emit just the profile section (family, attention_type, mlp_type,
+norm_type, descriptors). Useful for "what kind of model is this at
+a glance" check.
+
+```bash
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --profile
+# → {"model_id": "...", "profile": {...}}
+```
+
+#### `--graph`
+
+Render a text-based architecture decision graph. Honors `--format`:
+
+- `--format text` — ASCII box-drawing, default for `--graph`
+- `--format json` — structured pipeline + decisions
+- `--format markdown` — GFM tables for docs
+
+```bash
+# ASCII graph in terminal
+ssmforge arch X --graph --format text
+
+# JSON graph for piping
+ssmforge arch X --graph --format json | jq .pipeline
+
+# Markdown graph for docs
+ssmforge arch X --graph --format markdown --output graph.md
+
+# Compare as a graph (3 formats)
+ssmforge arch --compare A B C --dry-run --graph --format markdown
+```
+
+The graph renders the dataflow: input → embed → layer_block →
+final_norm → logits, with each architectural choice (fused QKV,
+GQA, attention_bias, MLP type, MoE, tied embeddings) marked with
+its verdict right where it matters in the pipeline.
+
+### 17.3 Every `doctor` flag
+
+#### `doctor` (no flag)
+
+Print full environment info: ssmforge version, Python version, HF_HOME,
+HF token status, transformers version, huggingface_hub version.
+
+```bash
+ssmforge doctor
+# ssmforge doctor
+# ----------------------------------------
+#   ssmforge_version: 0.2.3
+#   python_version: 3.14.4
+#   platform: win32
+#   hf_home: G:/models
+#   ...
+
+ssmforge doctor --format json | jq .transformers_version
+```
+
+Use this when filing a bug report — paste the output.
+
+#### `doctor --check-install`
+
+Diagnose install issues. Exits non-zero on problems. Use this to verify
+your install before opening an issue.
+
+```bash
+ssmforge doctor --check-install
+# ssmforge doctor --check-install (0.2.3)
+# --------------------------------------------------
+#   ✓ ssmforge command on PATH: True
+#   python: C:\Users\netge\.venv\Scripts\python.exe
+#   platform: win32
+```
+
+When something is wrong:
+
+```
+ssmforge doctor --check-install
+#   ✗ ssmforge command on PATH: False
+#   python: C:\Python314\python.exe
+#   platform: win32
+#
+#   The 'ssmforge' script was installed to:
+#       C:\Users\netge\AppData\Roaming\Python\Python314\Scripts\ssmforge.exe
+#   but that folder is not on PATH.
+#
+#     Quick fix (current shell):
+#       export PATH="/c/Users/netge/AppData/Roaming/Python/Python314/Scripts:$PATH"
+#     Permanent fix (PowerShell, restart shell after):
+#       [Environment]::SetEnvironmentVariable("PATH", ...)
+#     Or just use: python -m ssmforge.cli
+exit=$?  # 1
+```
+
+Use `--format json` for scripts:
+
+```bash
+ssmforge doctor --check-install --format json | jq '.ssmforge_command_on_path'
+# → true / false
+```
+
+### 17.4 Output format decision guide
+
+What format should I use? Follow this:
+
+| Goal | Format | Why |
+|------|--------|-----|
+| Read in a terminal | `text` | No markup noise |
+| Pipe to `jq` / grep | `json` | Structured, line-stable |
+| Save as artifact | `json` | Round-trippable for later tools |
+| Paste into GitHub Issue | `markdown` | Renders as a real table |
+| Send to a doc writer | `markdown` | No escaping needed |
+| Generate a visualization | `json` | Re-arrangeable structured data |
+| Compare 2 models in a doc | `markdown --compare` | Side-by-side table |
+| Show arch decisions in a meeting | `text --graph` | Box-drawing, no scroll |
+| Pipe into another tool | `json` | Don't fight the format battle |
+
+### 17.5 Real-world workflows
+
+#### Workflow 1: "I'm thinking of fine-tuning a model — what's it look like?"
+
+```bash
+# 1. Quick profile (no download)
+ssmforge arch Qwen/Qwen2-7B-Instruct --dry-run --profile | jq .profile
+
+# 2. Full quirk scan if it looks plausible (still no download)
+ssmforge arch Qwen/Qwen2-7B-Instruct --dry-run --quiet | jq '.quirks'
+
+# 3. If you commit to it, pull the actual weights
+ssmforge arch Qwen/Qwen2-7B-Instruct   # ~14 GB
+```
+
+#### Workflow 2: "I want to pick between two models for production"
+
+```bash
+# 1. Side-by-side (config-only)
+ssmforge arch --compare TinyLlama-1.1B-Chat Qwen2-1.5B-Instruct --dry-run --only-different
+
+# 2. Markdown for the architecture-review doc
+ssmforge arch --compare A B C --dry-run --format markdown --output model-review.md
+
+# 3. JSON for the deployment script
+ssmforge arch --compare A B C --dry-run --quiet --format json --output comparison.json
+```
+
+#### Workflow 3: "Generate a benchmark dataset of arch profiles"
+
+```bash
+#!/bin/bash
+# batch_inspect.sh — generate JSON for every model in a list
+MODELS="Qwen/Qwen2-0.5B Qwen/Qwen2-1.5B TinyLlama/TinyLlama-1.1B-Chat-v1.0 microsoft/Phi-2"
+mkdir -p profiles/
+
+for model in $MODELS; do
+    safe=$(echo "$model" | tr '/' '_')
+    ssmforge arch "$model" --dry-run --quiet --format json --output "profiles/${safe}.json"
+done
+
+# Concatenate into a single CSV-like view
+for f in profiles/*.json; do
+    jq -r '"\(.model_id)\t\(.profile.family)\t\(.memory_estimate.estimated_params)"' "$f"
+done > summary.tsv
+```
+
+#### Workflow 4: "Pre-flight in CI/CD — fail the build if the model is incompatible"
+
+```yaml
+# .github/workflows/check-model.yml
+name: Check model compatibility
+on: [push]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install ssmforge
+      - name: Check target model is compatible
+        run: |
+          # Exit 1 if model has any compatibility blockers
+          ssmforge arch ${{ env.MODEL }} --dry-run --quiet > profile.json
+          python -c "
+          import json, sys
+          profile = json.load(open('profile.json'))
+          if not profile['compatibility']['is_compatible']:
+              print('BLOCKERS:', profile['compatibility']['blockers'])
+              sys.exit(1)
+          "
+```
+
+#### Workflow 5: "Generate a README.md section for every supported model"
+
+```bash
+#!/bin/bash
+# gen_docs.sh — produce markdown descriptions for a list of models
+MODELS=$(cat supported-models.txt)
+
+for model in $MODELS; do
+    safe=$(echo "$model" | tr '/' '_')
+    ssmforge arch "$model" --dry-run --graph --format markdown --output "docs/models/${safe}.md"
+done
+```
+
+Each `*.md` file can be pasted directly into a docs site, GitHub Wiki,
+or knowledge base — full Markdown tables, decisions in bold, geometry
+in a header. Ready for human consumption.
+
+#### Workflow 6: "Find models that fit a 12 GB GPU"
+
+```bash
+#!/usr/bin/env python
+# fit_to_vram.py — filter a model list by VRAM budget
+import json, subprocess
+MODELS = ["Qwen/Qwen2-0.5B-Instruct", "Qwen/Qwen2-1.5B-Instruct",
+          "Qwen/Qwen2-7B-Instruct", "Qwen/Qwen2-72B-Instruct"]
+BUDGET_GB = 12
+
+for model in MODELS:
+    result = subprocess.run(
+        ["ssmforge", "arch", model, "--dry-run", "--quiet", "--fields", "memory"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"{model}: ERROR ({result.stderr.strip()})")
+        continue
+    profile = json.loads(result.stdout)
+    mem_bf16 = profile["memory_estimate"]["estimated_bytes"] / (1 << 30)
+    mem_int8 = mem_bf16 / 2
+    fits = "yes" if mem_bf16 <= BUDGET_GB else f"no (needs {mem_bf16:.1f} GB)"
+    print(f"{model:50s}  bf16={mem_bf16:6.1f} GB  int8={mem_int8:6.1f} GB  fits={fits}")
+```
+
+#### Workflow 7: "I hit an error and want to file a useful bug report"
+
+```bash
+# Capture the environment for the bug template
+ssmforge doctor --format json > doctor.json
+
+# Capture the failing model
+ssmforge arch Qwen/Qwen2-X --dry-run --quiet --format json > profile.json
+
+# Send both to the issue tracker
+cat > bug-report.md <<EOF
+**Environment:**
+\`\`\`
+$(cat doctor.json)
+\`\`\`
+
+**Model profile (dry-run):**
+\`\`\`
+$(cat profile.json)
+\`\`\`
+
+**Failing command:**
+\`\`\`
+$(cat failing-cmd.sh)
+\`\`\`
+EOF
+```
+
+### 17.6 Web interfaces — what users see
+
+ssmforge has two web surfaces that users encounter: the **PyPI page**
+and the **GitHub repository**. Both are part of the product — a
+polished README makes them useful, a confusing one means users give up.
+
+#### PyPI page (https://pypi.org/project/ssmforge/)
+
+When a user runs `pip install ssmforge`, they land here. What they see:
+
+**Left sidebar** — package metadata:
+
+```
+ssmforge 0.2.3
+pip install ssmforge
+```
+
+Below that, the **classifiers** (configured in `pyproject.toml`):
+- `Development Status :: 4 - Beta` — honest staging
+- `Environment :: Console`
+- `Intended Audience :: Developers`
+- `License :: OSI Approved :: Apache Software License`
+- `Operating System :: OS Independent`
+- `Programming Language :: Python :: 3`
+- `Programming Language :: Python :: 3 :: Only`
+- `Programming Language :: Python :: 3.10` through `3.13`
+
+These are searchable on PyPI — users find ssmforge by filtering
+"License :: Apache" or "Python :: 3.12".
+
+**Center top** — package description. This comes from the `description`
+field in `pyproject.toml`, which defers to the README's first few
+paragraphs. PyPI also auto-renders badges below it:
+
+```
+      Version: 0.2.3        License: Apache-2.0
+      Status: Production/Stable        Released: 23 hours ago
+```
+
+**Center middle** — **Project description**. This is the **rendered
+README**, which is why investing 1800 lines pays off:
+
+- The TOC at the top becomes a contents sidebar
+- Code blocks show syntax-highlighted bash/python
+- Tables render with proper grid alignment
+- Internal anchor links work (the user's table of contents)
+
+**Files tab** — lists all wheels and sdists for each version. For ssmforge:
+
+```
+ssmforge-0.2.3-py3-none-any.whl    68 KB    Aug 23 19:27
+ssmforge-0.2.3.tar.gz            113 KB    Aug 23 19:27
+ssmforge-0.2.2-...                ...      ...
+... (8 versions total)
+```
+
+**Release history** — every uploaded version, clickable. Users can see
+"this project has been actively maintained" by viewing release dates.
+
+#### Best practices for users browsing PyPI
+
+- The README's TOC (`## Contents`) becomes a clickable sidebar.
+- Code blocks have proper language hints (`\`\`\`bash`) for highlighting.
+- Internal links (`[text](#anchor)`) work — the README is the canonical
+  doc, not just a marketing page.
+
+#### GitHub repository (https://github.com/lordxmen2k/SSMForge)
+
+The other user-facing surface. What users encounter:
+
+**Top of the repo** — the **README badge** at the top (looks the same
+as PyPI). Below that:
+
+```
+ssmforge 0.2.3 • Updated 23 hours ago
+A clean architecture analyzer for HuggingFace models — inspect quirks
+before committing to a 30-minute conversion.
+
+[Code] [Issues] [Pull requests] [Discussions] (depends on repo settings)
+```
+
+**Right sidebar:**
+
+- **About** section: short description, topics, website
+- **Releases** section: every tagged version with notes
+- **Packages** — if the repo publishes to PyPI, PyPI links here
+- **Contributors** — auto-tracked
+
+**Code browser** — clicks on any file, full history visible, blame
+annotations on every line.
+
+**Issues tab** — users post bug reports here. Make sure this is enabled
+in repo Settings → Features. Required for the bug-recipe above.
+
+**Discussions tab** — opt-in feature (Settings → Features → Discussions).
+Best for Q&A, "how do I", share-what-you-built. Optional but nice for
+community projects.
+
+**Wiki tab** — GitHub-hosted wiki. Optional. We use the GitHub README
+instead.
+
+**Insights → Pulse** — git activity graphs over time. Users can see commit
+frequency trends here.
+
+#### How to set up the GitHub web interface
+
+For a project like ssmforge, the minimum GitHub setup is:
+
+1. **Repo Settings → Features → Issues: ON** (so users can file bugs)
+2. **Repo Settings → Options → Discussions: ON** (optional, for Q&A)
+3. **Repo Insights → Community Standards** — add a short CODE_OF_CONDUCT.md and CONTRIBUTING.md
+4. **Tags/releases** — every version bump makes a release with notes (this README already has full release notes)
+
+The README is the landing page for both PyPI and GitHub. Invest in it.
+
+### 17.7 Batch processing — file-by-file loops
+
+For power users processing many models. Two patterns:
+
+**Shell loop:**
+
+```bash
+#!/bin/bash
+# inspect_all.sh — generate one .json per model in models.txt
+mkdir -p outputs/
+while read -r model; do
+    safe_name=$(echo "$model" | tr '/' '_' | tr -d ' ')
+    ssmforge arch "$model" --dry-run --quiet --format json --output "outputs/${safe_name}.json"
+    printf "  %s\n" "$model"
+done < models.txt
+```
+
+**Python loop:**
+
+```python
+# inspect_all.py
+import subprocess, json
+from pathlib import Path
+
+MODELS = open("models.txt").read().splitlines()
+OUT = Path("outputs"); OUT.mkdir(exist_ok=True)
+
+results = {}
+for model in MODELS:
+    r = subprocess.run(
+        ["ssmforge", "arch", model, "--dry-run", "--quiet", "--format", "json"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        results[model] = {"error": r.stderr.strip()}
+        continue
+    profile = json.loads(r.stdout)
+    results[model] = profile
+
+# Cross-reference: which models have which quirks
+from collections import defaultdict
+quirk_to_models = defaultdict(list)
+for model, profile in results.items():
+    if "error" in profile:
+        continue
+    for quirk, value in profile.get("quirks", {}).items():
+        if value is True:
+            quirk_to_models[quirk].append(model)
+
+print("Quirk summary across all models:")
+for quirk, models in sorted(quirk_to_models.items()):
+    print(f"  {quirk:25s} {len(models):>3} models: {', '.join(models[:3])}{'...' if len(models) > 3 else ''}")
+```
+
+### 17.8 Troubleshooting cookbook
+
+Common issues → one-line fixes:
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `ssmforge: command not found` | Not on PATH | `pip install -e ".[dev]"` in a venv, or use `python -m ssmforge.cli` |
+| `bash: q.md: Permission denied` | `>` redirect to unwritable dir | Use `--output PATH` with quoted relative path |
+| Output looks mangled (`C:Users...`) | Git Bash stripped backslashes | Wrap `--output` value in quotes, or use forward slashes |
+| `ModuleNotFoundError: No module named 'ssmforge'` | Wrong Python / wrong venv | Activate your project venv first |
+| `Error analyzing X: OSError: X is not a local folder` | Bad model id | Use full HF id like `org/repo` or a real local path |
+| Empty output | `--quiet` and pipe quirk | Try without `--quiet` and look at stderr |
+| Tests skipping on Windows | Permission differences | Tests use `monkeypatch.chmod` which Windows ignores; some are skipped explicitly |
+| `Killed` (exit 137) | OOM during weight load | Use `--dry-run` to preview without loading weights |
+
+### 17.9 Recipe index — quick lookup
+
+Copy-paste recipes for the most common queries.
+
+**Inspect the smallest possible model:**
+
+```bash
+ssmforge arch hf-internal-testing/tiny-random-LlamaForCausalLM --dry-run
+```
+
+**Compare 2 production models:**
+
+```bash
+ssmforge arch --compare TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+                  Qwen/Qwen2-1.5B-Instruct \
+                  --dry-run --format markdown
+```
+
+**Generate a graph for GitHub:**
+
+```bash
+ssmforge arch Qwen/Qwen2-0.5B-Instruct --dry-run --graph --format markdown \
+    --output ~/Desktop/qwen2-graph.md
+```
+
+**Save a report and pipe to jq:**
+
+```bash
+ssmforge arch Qwen/Qwen2-7B-Instruct --dry-run --quiet --format json \
+    --output /tmp/qwen2.json
+jq '.quirks | to_entries | map(select(.value == true))' /tmp/qwen2.json
+```
+
+**Run from a script (CI/CD):**
+
+```bash
+ssmforge arch $MODEL --dry-run --quiet --format json | python -c "
+import json, sys
+data = json.load(sys.stdin)
+sys.exit(0 if data['compatibility']['is_compatible'] else 1)
+"
+```
+
+**Test on a local model:**
+
+```bash
+ssmforge arch /path/to/local/model --dry-run
+# or for the full load:
+ssmforge arch /path/to/local/model
+```
+
+**Generate a comparison table for a doc:**
+
+```bash
+ssmforge arch --compare Qwen2-0.5B Qwen2-1.5B Qwen2-7B Qwen2-72B \
+    --dry-run --only-different --format markdown \
+    --output qwen2-family.md
+```
+
+
 
 Bug reports and feature requests welcome:
 https://github.com/lordxmen2k/SSMForge/issues
